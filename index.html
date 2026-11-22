@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f6f7fb">
+  <title>Forma</title>
+  <link rel="icon" href="logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+  <script src="text-fonts.js" defer></script>
+  <script src="draft-storage.js" defer></script>
+  <script src="layer-reorder.js" defer></script>
+  <script src="bucket-regions.js" defer></script>
+  <script src="guide-regions.js" defer></script>
+  <script src="ink.js" defer></script>
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><img src="logo.svg" alt="" width="38" height="38"><span>Forma</span></div>
+    <div class="header-actions">
+      <button class="icon-button" id="new-canvas" aria-description="新しいキャンバス" aria-label="新しいキャンバス"><i data-icon="newFile"></i></button>
+      <button class="icon-button" id="undo" aria-description="元に戻す（Ctrl+Z）" aria-label="元に戻す" disabled><i data-icon="undo"></i></button>
+      <button class="icon-button" id="redo" aria-description="やり直す（Ctrl+Shift+Z）" aria-label="やり直す" disabled><i data-icon="redo"></i></button>
+      <button class="export" id="export" aria-label="SVG を保存"><i data-icon="download"></i><span>SVG</span></button>
+      <button class="export export-png" id="export-png" aria-label="PNG を保存"><i data-icon="download"></i><span>PNG</span></button>
+    </div>
+  </header>
+
+  <main class="editor">
+    <aside class="tools panel" aria-label="ツール">
+      <section class="tool-grid primary-tools" aria-label="基本ツール">
+        <button class="tool" data-tool="select" aria-pressed="true" aria-description="選択（Y / V）" aria-label="選択" aria-keyshortcuts="Y V"><i data-icon="select"></i></button>
+        <button class="tool" data-tool="text" aria-pressed="false" aria-description="文字（A）" aria-label="文字"><i data-icon="text"></i></button>
+        <button class="tool" data-tool="bucket" aria-pressed="false" aria-description="塗りつぶし（B）" aria-label="塗りつぶし"><i data-icon="bucket"></i></button>
+      </section>
+      <section class="operations shape-tools" aria-label="図形">
+        <button class="shape-fill-switch" id="shape-fill" type="button" role="switch" aria-checked="true" aria-label="新しい図形の塗り" aria-description="新しく描く図形の塗りを切り替える">
+          <span class="switch-track" aria-hidden="true"><span class="switch-thumb"></span></span>
+          <i data-icon="bucket"></i>
+        </button>
+        <div class="tool-grid">
+          <button class="tool" data-tool="rect" aria-pressed="false" aria-label="四角形（R）"><i data-icon="rect"></i></button>
+          <button class="tool" data-tool="ellipse" aria-pressed="false" aria-label="円・楕円（O）"><i data-icon="ellipse"></i></button>
+          <button class="tool" data-tool="triangle" aria-pressed="false" aria-label="三角形（T）"><i data-icon="triangle"></i></button>
+          <button class="tool" data-tool="diamond" aria-pressed="false" aria-label="ひし形（D）"><i data-icon="diamond"></i></button>
+          <button class="tool" data-tool="guide" aria-pressed="false" aria-label="仕切りの直線（P）"><i data-icon="guide"></i></button>
+          <button class="tool" data-tool="curve" aria-pressed="false" aria-label="曲線の仕切り（C）"><i data-icon="curve"></i></button>
+          <button class="tool" data-tool="ink" aria-pressed="false" aria-label="鉛筆の直線（N）"><i data-icon="ink"></i></button>
+          <button class="tool" data-tool="ink-curve" aria-pressed="false" aria-label="鉛筆の曲線（Q）"><i data-icon="inkCurve"></i></button>
+        </div>
+      </section>
+      <section class="operations">
+        <div class="tool-grid">
+          <button class="tool" data-operation="union" aria-label="選んだ図形を一つにまとめる" disabled><i data-icon="union"></i></button>
+          <button class="tool" data-operation="subtract" aria-label="下の図形から上の図形をくり抜く" disabled><i data-icon="subtract"></i></button>
+          <button class="tool" data-operation="intersect" aria-label="重なった部分だけを残す" disabled><i data-icon="intersect"></i></button>
+          <button class="tool" data-operation="xor" aria-label="重なった部分を取り除く" disabled><i data-icon="xor"></i></button>
+        </div>
+      </section>
+    </aside>
+
+    <section class="workspace" aria-label="キャンバス">
+      <div class="workspace-header">
+        <h1 aria-label="キャンバス"><i data-icon="canvas"></i></h1>
+        <div class="workspace-meta">
+          <span class="save-state" role="status"><i id="save-state-icon" data-icon="check"></i><span id="save-state" class="sr-only">自動保存</span></span>
+          <button class="icon-button" id="restore-draft" aria-description="保存済みの作業を読み込む" aria-label="保存済みの作業を読み込む" disabled><i data-icon="folder"></i></button>
+        </div>
+      </div>
+      <div class="viewport" id="viewport">
+        <div class="artboard" id="artboard">
+          <svg id="drawing" viewBox="0 0 760 530" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="SVG の描画領域">
+            <g id="artwork"></g>
+            <g id="guide-overlay" aria-hidden="true">
+              <g id="guide-lines"></g>
+              <polyline id="guide-draft" vector-effect="non-scaling-stroke"/>
+              <path id="curve-draft" vector-effect="non-scaling-stroke"/>
+              <g id="guide-spacing"></g>
+              <path id="line-alignment" vector-effect="non-scaling-stroke"/>
+              <circle id="endpoint-snap" vector-effect="non-scaling-stroke" visibility="hidden"/>
+              <g id="guide-controls"></g>
+            </g>
+            <g id="selection-outlines" aria-hidden="true"></g>
+            <rect id="selection-marquee" vector-effect="non-scaling-stroke" aria-hidden="true"/>
+            <g id="draft" aria-hidden="true"></g>
+            <g id="resize-handles" aria-hidden="true"></g>
+            <g id="rotation-handle" aria-hidden="true"></g>
+            <g id="ink-controls" aria-hidden="true"></g>
+          </svg>
+        </div>
+      </div>
+      <footer class="workspace-footer">
+        <span class="canvas-hint"><i data-icon="mouse"></i><span id="canvas-hint" class="sr-only"></span></span>
+        <div class="zoom" aria-label="表示倍率">
+          <button class="icon-button" id="zoom-out" aria-description="縮小" aria-label="縮小"><i data-icon="minus"></i></button>
+          <button class="icon-button" id="zoom-reset" aria-description="表示倍率をリセット" aria-label="表示倍率をリセット"><i data-icon="fit"></i></button>
+          <button class="icon-button" id="zoom-in" aria-description="拡大" aria-label="拡大"><i data-icon="plus"></i></button>
+        </div>
+      </footer>
+    </section>
+
+    <aside class="inspector panel" aria-label="プロパティ">
+      <section class="text-section" id="text-section" hidden>
+        <h2 id="text-heading" aria-label="文字を追加"><i data-icon="text"></i></h2>
+        <form id="text-form">
+          <input type="text" id="text-value" maxlength="64" aria-label="文字" required>
+          <select id="text-font" aria-label="書体" hidden></select>
+          <div class="font-options" id="font-options" role="group" aria-label="書体"></div>
+          <svg id="text-preview" viewBox="0 0 210 58" aria-hidden="true"></svg>
+          <p id="text-message" class="sr-only" role="status" hidden></p>
+          <button id="text-submit" type="submit" aria-description="文字を追加" aria-label="文字を追加"><i data-icon="check"></i></button>
+        </form>
+      </section>
+      <section class="color-section">
+        <div class="paint-heading">
+          <h2 aria-label="塗り"><label for="fill-enabled"><i data-icon="bucket"></i></label></h2>
+          <input type="checkbox" id="fill-enabled" aria-label="塗り" checked>
+        </div>
+        <div class="fill-colors">
+          <div class="color-field">
+            <input type="color" id="fill" value="#7770e6" aria-label="塗りの色" aria-description="色を選ぶ">
+            <input type="text" id="hex" value="#7770E6" maxlength="7" spellcheck="false" aria-label="塗りの色コード" hidden>
+          </div>
+          <div class="palette" id="palette" aria-label="カラーパレット"></div>
+        </div>
+        <div class="ink-settings" id="ink-settings" hidden>
+          <label class="stroke-width-field">
+            <i data-icon="ink"></i>
+            <input type="range" id="ink-width" min="0.5" max="64" step="0.5" value="5" aria-label="鉛筆の太さ">
+          </label>
+        </div>
+        <div class="stroke-section">
+          <div class="paint-heading">
+            <h2 aria-label="枠線"><label for="stroke-enabled"><i data-icon="strokeWeight"></i></label></h2>
+            <input type="checkbox" id="stroke-enabled" aria-label="枠線">
+          </div>
+          <div class="stroke-fields">
+            <input type="color" id="stroke-color" value="#2e3148" aria-label="枠線の色" disabled>
+            <label class="stroke-width-field">
+              <input type="range" id="stroke-width" min="0.5" max="64" step="0.5" value="2" aria-label="枠線の太さ" disabled>
+            </label>
+          </div>
+          <div class="stroke-joins" role="group" aria-label="枠線の角">
+            <button class="stroke-join" type="button" data-stroke-join="round" aria-label="枠線の角を丸める" aria-pressed="true" disabled><i data-icon="strokeRound"></i></button>
+            <button class="stroke-join" type="button" data-stroke-join="miter" aria-label="枠線の角を立てる" aria-pressed="false" disabled><i data-icon="strokeMiter"></i></button>
+          </div>
+        </div>
+        <div class="opacity-section">
+          <div class="opacity-fields">
+            <div class="opacity-presets" role="group" aria-label="不透明度">
+              <button type="button" data-opacity="80" aria-description="不透明度 80%" aria-label="不透明度 80%" aria-pressed="false"><span style="opacity:.8"></span></button>
+              <button type="button" data-opacity="50" aria-description="不透明度 50%" aria-label="不透明度 50%" aria-pressed="false"><span style="opacity:.5"></span></button>
+              <button type="button" data-opacity="20" aria-description="不透明度 20%" aria-label="不透明度 20%" aria-pressed="false"><span style="opacity:.2"></span></button>
+            </div>
+            <input type="range" id="opacity" min="0" max="100" step="1" value="100" aria-label="不透明度">
+            <input type="number" id="opacity-value" min="0" max="100" step="1" value="100" aria-label="不透明度（%）" hidden>
+          </div>
+        </div>
+      </section>
+      <section class="layer-section">
+        <div class="layer-header">
+          <h2 aria-label="レイヤー"><i data-icon="layers"></i><span id="layer-count" class="sr-only"></span></h2>
+          <div class="layer-actions">
+            <button class="icon-button" id="layer-copy" aria-description="コピー（Ctrl+C）" aria-label="コピー" disabled><i data-icon="copy"></i></button>
+            <button class="icon-button" id="layer-paste" aria-description="貼り付け（Ctrl+V）" aria-label="貼り付け" disabled><i data-icon="paste"></i></button>
+            <button class="icon-button" id="layer-up" aria-description="選んだレイヤーを手前へ" aria-label="選んだレイヤーを手前へ" disabled><i data-icon="chevronUp"></i></button>
+            <button class="icon-button" id="layer-down" aria-description="選んだレイヤーを奥へ" aria-label="選んだレイヤーを奥へ" disabled><i data-icon="chevronDown"></i></button>
+            <button class="icon-button" id="delete" aria-description="選択した図形を削除（Delete）" aria-label="選択した図形を削除" disabled><i data-icon="trash"></i></button>
+          </div>
+        </div>
+        <div class="layer-group-actions" role="group" aria-label="レイヤーのグループ操作">
+          <button id="layer-group" type="button" aria-description="グループ化（Shift＋クリックで複数選択）" aria-label="グループ化" disabled><i data-icon="link"></i></button>
+          <button id="layer-ungroup" type="button" aria-description="グループ解除" aria-label="グループ解除" disabled><i data-icon="unlink"></i></button>
+        </div>
+        <div id="layers" aria-label="レイヤー一覧"></div>
+        <span class="sr-only" id="layer-order-status" role="status"></span>
+      </section>
+    </aside>
+  </main>
+  <div class="notice" id="notice" role="status" hidden><i id="notice-icon" data-icon="check"></i><span id="notice-text" class="sr-only"></span></div>
+</body>
+</html>
