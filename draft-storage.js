@@ -29,7 +29,9 @@ const draftStorage = (() => {
       const { matrix } = shape;
       requireValid(Array.isArray(matrix) && matrix.length === 6 && matrix.every(isNumber));
       requireValid(matrix[0] * matrix[3] - matrix[1] * matrix[2] !== 0);
-      return { kind: shape.kind, matrix, base: restoreShape(shape.base) };
+      const base = restoreShape(shape.base);
+      if (base.kind === "ink" && !inkIsometry(matrix)) return transformInkGeometry(base, matrix);
+      return { kind: shape.kind, matrix, base };
     }
     if (shape.kind === "outline") {
       const { width, join } = shape;

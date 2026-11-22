@@ -6,6 +6,20 @@ function inkCurveGeometry({ points: [start, middle, end], controls }) {
   return { start, middle, end, controls };
 }
 
+function inkIsometry([a, b, c, d]) {
+  return Math.abs(a * a + b * b - 1) <= guideEpsilon &&
+    Math.abs(c * c + d * d - 1) <= guideEpsilon && Math.abs(a * c + b * d) <= guideEpsilon;
+}
+
+function transformInkGeometry(ink, matrix) {
+  const [a, b, c, d, e, f] = matrix;
+  const project = ({ x, y }) => ({ x: a * x + c * y + e, y: b * x + d * y + f });
+  return {
+    ...ink, points: ink.points.map(project),
+    ...(ink.controls ? { controls: ink.controls.map(project) } : {}),
+  };
+}
+
 function inkPathData(shape) {
   const cached = inkPaths.get(shape);
   if (cached) return cached.data;

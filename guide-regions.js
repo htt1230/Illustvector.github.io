@@ -27,14 +27,10 @@ function curveSegment(curve, pair) {
 }
 
 function curveWithEndpoint(curve, indices, point) {
-  const updated = { ...curve, controls: curve.controls?.slice() };
+  const updated = { ...curve, controls: bezierHandles(curve) };
   for (const index of indices) {
     const key = index === 0 ? "start" : "end";
-    const anchor = curve[key];
     updated[key] = point;
-    if (updated.controls) {
-      updated.controls[index] = guidePoint(updated.controls[index], point.x - anchor.x, point.y - anchor.y, 1);
-    }
   }
   return updated;
 }

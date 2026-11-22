@@ -68,7 +68,7 @@
           <button class="icon-button" id="restore-draft" aria-description="保存済みの作業を読み込む" aria-label="保存済みの作業を読み込む" disabled><i data-icon="folder"></i></button>
         </div>
       </div>
-      <div class="viewport" id="viewport">
+      <div class="viewport" id="viewport" tabindex="0" aria-label="スクロールできるキャンバス">
         <div class="artboard" id="artboard">
           <svg id="drawing" viewBox="0 0 760 530" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="SVG の描画領域">
             <g id="artwork"></g>
@@ -78,6 +78,7 @@
               <path id="curve-draft" vector-effect="non-scaling-stroke"/>
               <g id="guide-spacing"></g>
               <path id="line-alignment" vector-effect="non-scaling-stroke"/>
+              <path id="center-alignment" vector-effect="non-scaling-stroke"/>
               <circle id="endpoint-snap" vector-effect="non-scaling-stroke" visibility="hidden"/>
               <g id="guide-controls"></g>
             </g>
@@ -94,7 +95,7 @@
         <span class="canvas-hint"><i data-icon="mouse"></i><span id="canvas-hint" class="sr-only"></span></span>
         <div class="zoom" aria-label="表示倍率">
           <button class="icon-button" id="zoom-out" aria-description="縮小" aria-label="縮小"><i data-icon="minus"></i></button>
-          <button class="icon-button" id="zoom-reset" aria-description="表示倍率をリセット" aria-label="表示倍率をリセット"><i data-icon="fit"></i></button>
+          <button class="icon-button" id="zoom-reset" aria-label="表示倍率をリセット">100%</button>
           <button class="icon-button" id="zoom-in" aria-description="拡大" aria-label="拡大"><i data-icon="plus"></i></button>
         </div>
       </footer>
@@ -113,6 +114,17 @@
         </form>
       </section>
       <section class="color-section">
+        <div class="size-fields" id="size-fields" role="group" aria-label="図形の寸法" hidden>
+          <label class="size-field">
+            <i data-icon="measureHeight"></i>
+            <input id="size-height" type="number" min="0.001" max="1000000000" step="any" aria-label="縦の長さ">
+          </label>
+          <button type="button" class="icon-button" id="size-link" aria-label="縦横比を固定" aria-pressed="false"><i data-icon="link"></i></button>
+          <label class="size-field">
+            <i data-icon="measureWidth"></i>
+            <input id="size-width" type="number" min="0.001" max="1000000000" step="any" aria-label="横の長さ">
+          </label>
+        </div>
         <div class="paint-heading">
           <h2 aria-label="塗り"><label for="fill-enabled"><i data-icon="bucket"></i></label></h2>
           <input type="checkbox" id="fill-enabled" aria-label="塗り" checked>

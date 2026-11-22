@@ -11,6 +11,7 @@ const curveDraft = byId("curve-draft");
 const guideControls = byId("guide-controls");
 const guideSpacingMarks = byId("guide-spacing");
 const lineAlignmentMark = byId("line-alignment");
+const centerAlignmentMark = byId("center-alignment");
 const endpointSnapMark = byId("endpoint-snap");
 const inkControls = byId("ink-controls");
 const inkWidthInput = byId("ink-width");
@@ -38,9 +39,10 @@ const icons = {
   paste: '<rect x="5" y="6" width="14" height="15" rx="2"/><rect x="9" y="3" width="6" height="5" rx="1"/><path d="M9 13h6m-6 4h6"/>',
   check: '<path d="m5 12 4 4L19 6"/>',
   warning: '<path d="M12 3 2.5 20h19zM12 9v4m0 3v.1"/>',
-  fit: '<path d="M9 4H4v5m11-5h5v5M4 15v5h5m11-5v5h-5"/><rect x="8" y="8" width="8" height="8" rx="1"/>',
   layers: '<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/>',
   strokeWeight: '<path d="M4 5h16" stroke-width="1"/><path d="M4 11h16" stroke-width="2.5"/><path d="M4 18h16" stroke-width="4"/>',
+  measureWidth: '<path d="M4 7v10m16-10v10M4 12h16"/>',
+  measureHeight: '<path d="M7 4h10M7 20h10M12 4v16"/>',
   link: '<path d="m10 8 2-2a4 4 0 0 1 6 6l-2 2m-2 2-2 2a4 4 0 0 1-6-6l2-2m1 5 6-6"/>',
   unlink: '<path d="m13 6 1-1a4 4 0 0 1 6 6l-1 1m-8 6-1 1a4 4 0 0 1-6-6l1-1m3-5-2-2m7 5 2 3m1 4 2 2"/>',
   download: '<path d="M12 3v12m-4-4 4 4 4-4M4 16v4h16v-4"/>',
@@ -107,6 +109,7 @@ let displayedInkControls = "";
 let curvePoints = [];
 let curveCursor = null;
 let curveStartControl = null;
+let pendingStraight = null;
 let facesFromGuides = null;
 let guideFaces = [];
 let inkBarrierCache = null;
@@ -125,6 +128,7 @@ let zoom = 1;
 let gesture = null;
 let drawingFrame = 0;
 let resizeId = null;
+let aspectRatioLocked = false;
 let colorPreview = null;
 let strokePreview = null;
 let opacityPreview = null;
@@ -236,9 +240,13 @@ function primaryGeometryLayer() {
 }
 
 function transformShape(shape, matrix) {
-  return shape.kind === "affine"
-    ? { ...shape, matrix: multiplyMatrices(matrix, shape.matrix) }
-    : { kind: "affine", base: shape, matrix };
+  if (shape.kind === "outline" && baseInk(shape.base)) {
+    return { ...shape, base: transformShape(shape.base, matrix) };
+  }
+  const base = shape.kind === "affine" ? shape.base : shape;
+  const transform = shape.kind === "affine" ? multiplyMatrices(matrix, shape.matrix) : matrix;
+  if (base.kind === "ink" && !inkIsometry(transform)) return transformInkGeometry(base, transform);
+  return { kind: "affine", base, matrix: transform };
 }
 
 function framePoint({ box, matrix }, dx, dy, padding = 0) {
@@ -272,6 +280,9 @@ function compoundBounds(shape) {
     return { x: box.x - pad, y: box.y - pad, w: box.w + 2 * pad, h: box.h + 2 * pad };
   }
   if (shape.kind === "affine") {
+    if (shape.base.kind === "ink" && inkIsometry(shape.matrix)) {
+      return inkBounds(transformInkGeometry(shape.base, shape.matrix));
+    }
     const points = frameCorners(shapeFrame(shape));
     const xs = points.map(({ x }) => x);
     const ys = points.map(({ y }) => y);
@@ -392,10 +403,9 @@ function move(shape, dx, dy) {
 }
 
 function scaleShape(shape, before, after) {
-  if (shape.kind === "affine") {
-    return { ...shape, matrix: multiplyMatrices(scalingMatrix(before, after), shape.matrix) };
+  if (shape.kind === "affine" || shape.kind === "outline" || shape.kind === "ink") {
+    return transformShape(shape, scalingMatrix(before, after));
   }
-  if (shape.kind === "outline" || shape.kind === "ink") return { kind: "affine", base: shape, matrix: scalingMatrix(before, after) };
   if (shape.kind === "xor" && shape.paints?.length) {
     return { kind: "affine", base: shape, matrix: scalingMatrix(before, after) };
   }
@@ -411,6 +421,117 @@ function scaleShape(shape, before, after) {
     w: shape.w * scaleX,
     h: shape.h * scaleY,
   };
+}
+
+function resizeInkInBox(ink, before, after) {
+  const radius = ink.width / 2;
+  function axis(origin, length) {
+    const span = before[length] - ink.width;
+    if (span <= guideEpsilon) return [1, 0];
+    const scale = Math.max(guideEpsilon, after[length] - ink.width) / span;
+    return [scale, after[origin] + radius - (before[origin] + radius) * scale];
+  }
+  const [sx, x] = axis("x", "w");
+  const [sy, y] = axis("y", "h");
+  if (Math.abs(sx - 1) <= guideEpsilon && Math.abs(sy - 1) <= guideEpsilon &&
+    Math.abs(x) <= guideEpsilon && Math.abs(y) <= guideEpsilon) return ink;
+  return transformInkGeometry(ink, [sx, 0, 0, sy, x, y]);
+}
+
+function inkInWorld(shape) {
+  const ink = baseInk(shape);
+  return ink && (shape.kind === "affine" ? transformInkGeometry(ink, shape.matrix) : ink);
+}
+
+function groupSizeMatrix(targets, before, after, axis) {
+  const regular = scalingMatrix(before, after);
+  const members = layers.filter((layer) => targets.has(layer.id));
+  if (aspectRatioLocked || !members.some((layer) => baseInk(layer.shape))) return regular;
+
+  const origin = axis === "w" ? "x" : "y";
+  const intervals = members.map(({ shape }) => {
+    const ink = inkInWorld(shape);
+    const boundsOfMember = ink ? inkBounds(ink) : bounds(shape);
+    const pad = ink ? ink.width / 2 : 0;
+    const start = boundsOfMember[origin] - before[origin] + pad;
+    return { start, end: start + boundsOfMember[axis] - 2 * pad, pad };
+  });
+  function extentAt(scale) {
+    let min = Infinity;
+    let max = -Infinity;
+    for (const { start, end, pad } of intervals) {
+      min = Math.min(min, start * scale - pad);
+      max = Math.max(max, end * scale + pad);
+    }
+    return { min, length: max - min };
+  }
+
+  const geometricSpan = Math.max(...intervals.map(({ end }) => end)) - Math.min(...intervals.map(({ start }) => start));
+  if (geometricSpan <= guideEpsilon) return identityMatrix;
+  const desired = after[axis];
+  let low = 0;
+  let high = Math.max(1, desired / geometricSpan);
+  for (let step = 0; step < 40; step++) {
+    const middle = (low + high) / 2;
+    if (extentAt(middle).length < desired) low = middle;
+    else high = middle;
+  }
+  const scale = Math.max(guideEpsilon, (low + high) / 2);
+  const offset = after[origin] - before[origin] * scale - extentAt(scale).min;
+  return axis === "w" ? [scale, 0, 0, 1, offset, 0] : [1, 0, 0, scale, 0, offset];
+}
+
+function sizeTarget() {
+  const layer = primaryGeometryLayer();
+  if (!layer) return null;
+  const { shape, targets } = geometryTarget(layer);
+  if ([...selection].some((id) => !targets.has(id))) return null;
+  const worldInk = !layer.groupId && inkInWorld(shape);
+  const box = worldInk ? inkBounds(worldInk) : bounds(shape);
+  return box.w > 0 && box.h > 0 ? { layer, box, targets, ink: worldInk } : null;
+}
+
+function applySize(axis, input) {
+  const target = sizeTarget();
+  const value = input.valueAsNumber;
+  if (!target || !input.validity.valid || !Number.isFinite(value)) {
+    renderControls();
+    return;
+  }
+  const { layer, box, targets, ink } = target;
+  if (ink && box[axis] - ink.width <= guideEpsilon) {
+    renderControls();
+    return;
+  }
+  if (Math.abs(value - box[axis]) <= guideEpsilon) return;
+  const after = { ...box, [axis]: value };
+  if (aspectRatioLocked) {
+    const dimensions = ink ? ["w", "h"].filter((key) => box[key] - ink.width > guideEpsilon) : ["w", "h"];
+    const minSize = ink ? ink.width + .001 : Number(input.min);
+    const minimum = Math.max(...dimensions.map((key) => minSize / box[key]));
+    const maximum = Math.min(...dimensions.map((key) => Number(input.max) / box[key]));
+    if (minimum > maximum) {
+      renderControls();
+      return;
+    }
+    const scale = Math.max(minimum, Math.min(maximum, value / box[axis]));
+    for (const key of dimensions) after[key] = box[key] * scale;
+  } else if (ink) {
+    after[axis] = Math.max(ink.width + .001, after[axis]);
+  }
+  const resizedInk = ink ? resizeInkInBox(ink, box, after) : null;
+  if (ink && resizedInk === ink) {
+    renderControls();
+    return;
+  }
+  const matrix = layer.groupId ? groupSizeMatrix(targets, box, after, axis) : null;
+  if (matrix === identityMatrix) {
+    renderControls();
+    return;
+  }
+  commit(layers.map((item) => targets.has(item.id)
+    ? { ...item, shape: resizedInk ?? (matrix ? transformShape(item.shape, matrix) : scaleShape(item.shape, box, after)) }
+    : item));
 }
 
 const number = (value) => Number(value.toFixed(3));
@@ -709,10 +830,10 @@ function renderArtwork(visible, targets, transform) {
   }
 }
 
-function renderOutlines(visible, targets, transform) {
+function renderOutlines(visible, targets, transform, handleLayerId) {
   const primary = primarySelectionId();
   const primaryGroup = primaryGeometryLayer()?.groupId;
-  const resizeGroup = visible.find((layer) => layer.id === resizeId)?.groupId;
+  const resizeGroup = visible.find((layer) => layer.id === handleLayerId)?.groupId;
   const liveIds = new Set();
   for (const layer of visible) {
     if (!selection.has(layer.id) && !(primaryGroup && layer.groupId === primaryGroup)) continue;
@@ -722,7 +843,7 @@ function renderOutlines(visible, targets, transform) {
     const { w, h } = frame.box;
     if (!w || !h) continue;
     const active = layer.id === primary || (layer.groupId && layer.groupId === primaryGroup);
-    const resizing = layer.id === resizeId || (layer.groupId && layer.groupId === resizeGroup);
+    const resizing = layer.id === handleLayerId || (layer.groupId && layer.groupId === resizeGroup);
     const pad = resizing ? 0 : 3;
     liveIds.add(id);
     let outline = outlineElements.get(id);
@@ -751,6 +872,7 @@ function renderDrawing() {
   const movement = gesture?.type === "move" ? gesture : null;
   const rotation = gesture?.type === "rotate" ? rotationMatrix(gesture) : null;
   let targets = movement?.targets ?? (rotation ? gesture.targets : null);
+  let artworkTargets;
   let transform = null;
   if (movement && (movement.dx || movement.dy)) transform = "translate(" + movement.dx + " " + movement.dy + ")";
   if (rotation) transform = "matrix(" + rotation.join(" ") + ")";
@@ -760,6 +882,14 @@ function renderDrawing() {
     if (matrix) {
       targets = gesture.targets;
       transform = "matrix(" + matrix.join(" ") + ")";
+      if (!inkIsometry(matrix)) {
+        visible = visible.map((layer) => {
+          if (!targets.has(layer.id) || !baseInk(layer.shape)) return layer;
+          artworkTargets ??= new Set(targets);
+          artworkTargets.delete(layer.id);
+          return { ...layer, shape: transformShape(layer.shape, matrix) };
+        });
+      }
     } else if (gesture.preview && !gesture.group) {
       visible = visible.map((layer) => layer.id === gesture.layerId ? { ...layer, shape: gesture.preview } : layer);
     }
@@ -800,19 +930,21 @@ function renderDrawing() {
   if (opacityPreview !== null) {
     visible = visible.map((layer) => selection.has(layer.id) ? { ...layer, opacity: opacityPreview } : layer);
   }
-  renderArtwork(visible, targets, transform);
+  renderArtwork(visible, artworkTargets ?? targets, transform);
   renderGuides();
-  renderOutlines(visible, targets, transform);
+  const tap = gesture?.resizeTap;
+  const handleLayerId = tap && !tap.right && !tap.dragged ? tap.layerId : resizeId;
+  renderOutlines(visible, targets, transform, handleLayerId);
   renderSelectionMarquee();
-  const resizedLayer = visible.find((layer) => layer.id === resizeId);
+  const resizedLayer = visible.find((layer) => layer.id === handleLayerId);
   const resizedShape = resizedLayer?.groupId ? geometryTarget(resizedLayer).shape : resizedLayer?.shape;
-  renderResizeHandles(resizedShape, targets?.has(resizeId) ? transform : null);
+  renderResizeHandles(resizedShape, targets?.has(handleLayerId) ? transform : null);
   const primaryId = primaryGeometryLayer()?.id;
   const selectedLayer = visible.find((layer) => layer.id === primaryId);
   const selectedShape = selectedLayer?.groupId ? geometryTarget(selectedLayer).shape : selectedLayer?.shape;
   const selectedTransform = targets?.has(selectedLayer?.id) ? transform : null;
   renderRotationHandle(selectedShape, selectedTransform);
-  renderInkControls(visible, targets, transform);
+  renderInkControls(visible, artworkTargets ?? targets, transform);
 }
 
 function renderSelectionMarquee() {
@@ -828,9 +960,10 @@ function renderSelectionMarquee() {
 }
 
 function inkPreviewShape() {
-  if (gesture?.type === "ink") {
-    const points = lineStrokePoints(gesture);
-    return points.length === 2 ? { kind: "ink", points, width: gesture.width, curve: false } : null;
+  const stroke = previewStraightStroke();
+  if (stroke?.type === "ink") {
+    const points = lineStrokePoints(stroke);
+    return points.length === 2 ? { kind: "ink", points, width: stroke.width, curve: false } : null;
   }
   if (tool !== "ink-curve" || !curvePoints.length || !curveCursor) return null;
   const [start, middle] = curvePoints;
@@ -917,11 +1050,12 @@ function renderGuides() {
     jointGuideIndices = new Set(previews?.keys());
   }
   const resize = gesture?.type === "line-resize" && gesture.guideIndex !== undefined ? gesture : null;
-  const end = isStraightTool(gesture?.type) ? lineStrokeEnd(gesture) : null;
+  const stroke = previewStraightStroke();
+  const end = stroke ? lineStrokeEnd(stroke, true) : null;
   if (resize) {
     guideDraft.setAttribute("points", coordinates(resizedLineEnds(resize)));
-  } else if (gesture?.type === "guide") {
-    guideDraft.setAttribute("points", coordinates([gesture.start, end.point]));
+  } else if (stroke?.type === "guide") {
+    guideDraft.setAttribute("points", coordinates([stroke.start, end.point]));
   } else {
     guideDraft.removeAttribute("points");
   }
@@ -951,7 +1085,8 @@ function renderGuides() {
   movingGuideElements = moving;
   renderGuideSpacing(gesture?.spacingHint, gesture?.lengthHint ?? end?.lengthHint);
   renderLineAlignment(gesture?.alignmentHint);
-  const startSnap = isStraightTool(gesture?.type) && gesture.start !== gesture.pointerStart ? gesture.start : null;
+  renderCenterAlignment(gesture?.centerHint);
+  const startSnap = stroke && (stroke === pendingStraight || stroke.start !== stroke.pointerStart) ? stroke.start : null;
   renderEndpointSnap(end?.endpoint ?? gesture?.endpointSnap ?? startSnap);
 
   const [start, middle] = curvePoints;
@@ -1007,6 +1142,21 @@ function renderLineAlignment(hint) {
     number(tangent.y * along + normal.y * position));
   const data = "M" + points.join("L");
   if (lineAlignmentMark.getAttribute("d") !== data) lineAlignmentMark.setAttribute("d", data);
+}
+
+function renderCenterAlignment(hint) {
+  if (!hint) {
+    centerAlignmentMark.removeAttribute("d");
+    return;
+  }
+  const { point, x, y } = hint;
+  const pad = 5 * svgUnitsPerPixel();
+  let data = "";
+  if (x) data += "M" + number(point.x) + " " + number(Math.min(point.y, x.y) - pad) +
+    "V" + number(Math.max(point.y, x.y) + pad);
+  if (y) data += "M" + number(Math.min(point.x, y.x) - pad) + " " + number(point.y) +
+    "H" + number(Math.max(point.x, y.x) + pad);
+  if (centerAlignmentMark.getAttribute("d") !== data) centerAlignmentMark.setAttribute("d", data);
 }
 
 function lengthGuidePath([start, end]) {
@@ -1230,20 +1380,22 @@ function renderControls() {
   byId("delete").disabled = !selection.size;
   byId("layer-copy").disabled = !selection.size && !activeGuide;
   byId("layer-paste").disabled = !copiedObjects;
-  let hint = "空白からドラッグで範囲選択 · Shift で追加 · Ctrl でサイズ変更 · 右ドラッグで移動";
-  if (gesture?.type === "joint-move") hint = "接続点を移動 · 上下の線の中間で吸着 · Ctrl で吸着解除";
+  let hint = "クリックで拡縮ハンドル · 空白からドラッグで範囲選択 · Shift で追加 · 右ドラッグで移動";
+  if (gesture?.type === "curve-control" || gesture?.type === "curve-anchor") hint = "Shift でベジェハンドルを45°刻み";
+  else if (gesture?.type === "joint-move") hint = "接続点を移動 · 上下の線の中間で吸着 · Ctrl で吸着解除";
   else if (gesture?.type === "line-resize") hint = "端点で長さと角度を変更 · Shift で15°刻み · Ctrl で吸着解除";
   else if (isSnapMove(gesture)) hint = gesture.pointRows?.length >= 2
     ? "線の中間に吸着 · Shift で45°刻み · Ctrl で吸着解除"
     : gesture.lineLayout
     ? "位置合わせ・等間隔で吸着 · Shift で45°刻み · Ctrl で吸着解除"
     : "Shift で45°刻み · Ctrl で吸着解除";
-  else if (gesture?.type === "move") hint = "Shift で移動方向を45°刻みに固定";
+  else if (gesture?.type === "move") hint = "中心をそろえて吸着 · Shift で45°刻み · Ctrl で吸着解除";
   else if (resizeId !== null) hint = "角・辺中央で拡縮 · 辺をドラッグして変形 · Shift で比率固定";
-  else if (tool === "guide") hint = "ドラッグで直線の仕切り · Shift で15°刻み · Ctrl で吸着解除";
-  else if (tool === "ink") hint = "ドラッグで描画 · Alt＋クリックで塗る · Shift で15°刻み · Ctrl で吸着解除";
+  else if (pendingStraight) hint = "終点をクリック · 右クリックでキャンセル · Shift で15°刻み";
+  else if (tool === "guide") hint = "2回のクリックまたはドラッグで直線 · Shift で15°刻み · Ctrl で吸着解除";
+  else if (tool === "ink") hint = "2回のクリックまたはドラッグで直線 · Alt＋クリックで塗る · Ctrl で吸着解除";
   else if (tool === "curve" || tool === "ink-curve") {
-    const startHint = "始点・中点・終点をクリック · 始点からドラッグでベジェ · Ctrl で吸着解除";
+    const startHint = "始点・中点・終点をクリック · 始点からドラッグでベジェ · Shift で45°刻み";
     hint = curveStartControl ? "終点をクリックまたはドラッグ" : [startHint, "中点をクリック", "終点をクリック"][curvePoints.length];
   }
   else if (tool === "bucket") hint = "色を選び、塗りたい部分をクリック";
@@ -1252,6 +1404,16 @@ function renderControls() {
   byId("canvas-hint").textContent = hint;
   const primary = primarySelectionId();
   const selected = layers.find((layer) => layer.id === primary);
+  const dimensions = sizeTarget();
+  byId("size-fields").hidden = !dimensions;
+  byId("size-link").setAttribute("aria-pressed", aspectRatioLocked);
+  if (dimensions) {
+    for (const [id, axis] of [["size-width", "w"], ["size-height", "h"]]) {
+      const input = byId(id);
+      input.value = number(dimensions.box[axis]);
+      input.disabled = Boolean(dimensions.ink && dimensions.box[axis] - dimensions.ink.width <= guideEpsilon);
+    }
+  }
   const selectedInk = baseInk(selected?.shape);
   byId("ink-settings").hidden = !selectedInk && !isInkTool();
   inkWidthInput.value = selectedInk?.width ?? inkWidth;
@@ -1330,7 +1492,7 @@ function restore(from, to) {
   layers = state.layers;
   guides = state.guides;
   activeGuide = null;
-  clearCurvePlacement();
+  clearLinePlacement();
   selection = tool === "bucket" ? new Set() : new Set(state.selection);
   if (!selection.has(resizeId)) resizeId = null;
   render();
@@ -1341,7 +1503,7 @@ function chooseTool(value) {
   if (tool === value) return;
   cancelGesture();
   activeGuide = null;
-  clearCurvePlacement();
+  clearLinePlacement();
   resizeId = null;
   if (value !== "select") selection.clear();
   tool = value;
@@ -1404,11 +1566,14 @@ function beginBezierControl(handle, event, point) {
   if (guideIndex !== undefined) activeGuide = curve;
   const matrix = shape?.kind === "affine" ? shape.matrix : identityMatrix;
   const original = bezierHandles(curve)[index];
+  const anchor = index === 0 ? curve.start : curve.end;
   gesture = {
     type: "curve-control", id: event.pointerId, layerId, guideIndex, index, shape, matrix,
-    start: unprojectPoint(matrix, point), original, end: original,
+    start: point, pointer: point, original, end: original,
+    anchor: projectPoint(matrix, anchor), worldControl: projectPoint(matrix, original),
   };
   drawing.setPointerCapture(event.pointerId);
+  renderControls();
 }
 
 function withBezierControl(curve, { index, original, end }) {
@@ -1775,7 +1940,7 @@ function guideAtJoint(guide, indices, point) {
   return curveWithEndpoint(guide, indices, point);
 }
 
-function beginJointMove(event, start, original, { guideMembers, inkMembers }) {
+function beginJointMove(event, start, original, { guideMembers, inkMembers, layer }) {
   const references = sceneStraightLines(guideMembers, inkMembers);
   const oppositeRows = [];
   function addOppositeRows(endpoints, indices) {
@@ -1799,6 +1964,7 @@ function beginJointMove(event, start, original, { guideMembers, inkMembers }) {
     snapTargets: references.flat(), extendPointRows: true,
     dx: 0, dy: 0, rawDx: 0, rawDy: 0, lockAxis: event.shiftKey, disableSnap: event.ctrlKey || event.metaKey,
   };
+  trackResizeTap(event, layer);
   drawing.setPointerCapture(event.pointerId);
   renderDrawing();
   renderControls();
@@ -1892,6 +2058,7 @@ function beginLineResize(event, start, ends, endIndex, { guideIndex, layer }) {
     point: original, references, snapTargets, guideIndex, layerId: layer?.id, shape: layer?.shape,
     disableSnap: event.ctrlKey || event.metaKey, shiftKey: event.shiftKey,
   };
+  trackResizeTap(event, layer);
   drawing.dataset.resizing = "edge";
   drawing.setPointerCapture(event.pointerId);
   renderDrawing();
@@ -1949,6 +2116,102 @@ function movementDirection(dx, dy, locked) {
   return { dx: x * distance, dy: y * distance, direction: { x: x / length, y: y / length } };
 }
 
+function layerCenter(items) {
+  let left = Infinity;
+  let right = -Infinity;
+  let top = Infinity;
+  let bottom = -Infinity;
+  for (const layer of items) {
+    const { x, y, w, h } = bounds(layer.shape);
+    if (!w || !h) continue;
+    left = Math.min(left, x);
+    right = Math.max(right, x + w);
+    top = Math.min(top, y);
+    bottom = Math.max(bottom, y + h);
+  }
+  return Number.isFinite(left) ? { x: (left + right) / 2, y: (top + bottom) / 2 } : null;
+}
+
+function centerMoveReferences(targets) {
+  const references = [];
+  const moving = [];
+  for (const block of layerBlocks()) {
+    const visible = block.members.filter(visibleInkCandidate);
+    if (block.members.some((layer) => targets.has(layer.id))) {
+      for (const layer of visible) {
+        if (targets.has(layer.id)) moving.push(layer);
+      }
+    } else {
+      const center = layerCenter(visible);
+      if (center) references.push(center);
+    }
+  }
+  const center = layerCenter(moving);
+  return center && references.length ? { center, references } : null;
+}
+
+function snapShapeCenters(layout, dx, dy, direction, tolerance) {
+  if (!layout) return null;
+  const { center, references } = layout;
+  const point = { x: center.x + dx, y: center.y + dy };
+  function nearest(axis, maxDistance) {
+    const across = axis === "x" ? "y" : "x";
+    let offset = maxDistance;
+    let best = null;
+    for (const reference of references) {
+      const distance = Math.abs(reference[axis] - point[axis]);
+      if (distance > offset) continue;
+      if (distance === offset && best && Math.abs(best[across] - point[across]) <= Math.abs(reference[across] - point[across])) continue;
+      best = reference;
+      offset = distance;
+    }
+    return best;
+  }
+  if (direction) {
+    let correction = Infinity;
+    for (const axis of ["x", "y"]) {
+      const component = direction[axis];
+      if (Math.abs(component) <= guideEpsilon) continue;
+      const ref = nearest(axis, tolerance * Math.abs(component));
+      if (!ref) continue;
+      const candidate = (ref[axis] - point[axis]) / component;
+      if (Math.abs(candidate) < Math.abs(correction)) correction = candidate;
+    }
+    if (Number.isFinite(correction)) {
+      point.x += direction.x * correction;
+      point.y += direction.y * correction;
+    }
+  } else {
+    const x = nearest("x", tolerance);
+    const y = nearest("y", tolerance);
+    if (x) point.x = x.x;
+    if (y) point.y = y.y;
+  }
+  const x = nearest("x", guideEpsilon);
+  const y = nearest("y", guideEpsilon);
+  return x || y ? { dx: point.x - center.x, dy: point.y - center.y, hint: { point, x, y } } : null;
+}
+
+function updateBezierDirection(edit, locked) {
+  const x = edit.pointer.x - edit.start.x;
+  const y = edit.pointer.y - edit.start.y;
+  if (edit.type === "curve-anchor") {
+    if (!edit.dragged) return;
+    const sign = edit.ending ? -1 : 1;
+    const { dx, dy } = movementDirection(sign * x, sign * y, locked);
+    edit.control = { x: edit.position.x + dx, y: edit.position.y + dy };
+    if (!edit.ending) curveCursor = edit.control;
+  } else {
+    if (Math.hypot(x, y) <= guideEpsilon) {
+      edit.end = edit.original;
+      return;
+    }
+    const { anchor, worldControl } = edit;
+    const { dx, dy } = movementDirection(worldControl.x + x - anchor.x, worldControl.y + y - anchor.y, locked);
+    edit.end = unprojectPoint(edit.matrix, { x: anchor.x + dx, y: anchor.y + dy });
+  }
+}
+
 function updateSnapMove() {
   const { rawDx, rawDy, lockAxis, disableSnap, lineLayout, moveEnds, pointCenter, pointRows, oppositeRows, extendPointRows } = gesture;
   const { dx, dy, direction } = movementDirection(rawDx, rawDy, lockAxis);
@@ -1966,11 +2229,14 @@ function updateSnapMove() {
   const alignment = snap && !endpoint
     ? snapLineAlignment(lineLayout, spacing?.dx ?? dx, spacing?.dy ?? dy, direction, spacing && direction ? 0 : tolerance)
     : null;
-  const snapped = endpoint ?? alignment ?? spacing;
+  const center = snap && !endpoint && !alignment && !spacing
+    ? snapShapeCenters(gesture.centerLayout, dx, dy, direction, tolerance) : null;
+  const snapped = endpoint ?? alignment ?? spacing ?? center;
   gesture.dx = snapped?.dx ?? dx;
   gesture.dy = snapped?.dy ?? dy;
   gesture.spacingHint = spacing?.hint;
   gesture.alignmentHint = alignment?.hint;
+  gesture.centerHint = center?.hint;
   gesture.endpointSnap = endpoint?.target;
   drawing.dataset.moving = String(moved);
 }
@@ -2002,9 +2268,12 @@ function isCurveTool(type) {
 
 function lineStrokeEnd(stroke, snapToGuide = false) {
   const end = straightStrokeEnd(stroke);
-  if (stroke.controlKey) return { point: end };
+  if (stroke.controlKey || (end.x === stroke.start.x && end.y === stroke.start.y)) return { point: end };
   const limit = guideSnapDistance();
   const ray = stroke.shiftKey ? guideRay(stroke.start, end) : null;
+  if (stroke.targetAnchor && (!ray || guideRayContains(ray, stroke.targetAnchor))) {
+    return { point: stroke.targetAnchor, endpoint: stroke.targetAnchor };
+  }
   const endpoint = nearestLineEnd(end, stroke.snapTargets, limit, ray);
   if (endpoint) return { point: endpoint, endpoint };
   const length = snapLineLength(stroke.start, end, stroke.references, limit);
@@ -2069,6 +2338,10 @@ function updateStrokeStart(stroke, controlKey) {
   stroke.start = controlKey ? stroke.pointerStart : stroke.snappedStart;
 }
 
+function previewStraightStroke() {
+  return isStraightTool(gesture?.type) ? gesture : pendingStraight;
+}
+
 function startLineStroke(event, start, inkEndpoint) {
   const raw = pointOnCanvas(start);
   const controlKey = event.ctrlKey || event.metaKey;
@@ -2086,6 +2359,37 @@ function startLineStroke(event, start, inkEndpoint) {
   }
   drawing.setPointerCapture(event.pointerId);
   renderDrawing();
+}
+
+function updatePendingStraight(event, point) {
+  pendingStraight.end = pointOnCanvas(point);
+  pendingStraight.targetAnchor = clickedInkEndpoint(event)?.point ?? clickedGuideEndpoint(event);
+  pendingStraight.shiftKey = event.shiftKey;
+  pendingStraight.controlKey = event.ctrlKey || event.metaKey;
+}
+
+function finishStraightStroke(stroke) {
+  const points = lineStrokePoints(stroke, stroke.type === "guide");
+  if (points.length !== 2) return false;
+  pendingStraight = null;
+  if (stroke.type === "ink") commitInk({ kind: "ink", points, width: stroke.width, curve: false });
+  else commit(layers, selection, [...guides, points]);
+  return true;
+}
+
+function clearLinePlacement() {
+  pendingStraight = null;
+  clearCurvePlacement();
+}
+
+function cancelLinePlacement() {
+  const drawingLine = isStraightTool(gesture?.type) || gesture?.type === "curve-anchor";
+  if (!drawingLine && !pendingStraight && !curvePoints.length) return false;
+  clearLinePlacement();
+  if (drawingLine) cancelGesture();
+  else renderDrawing();
+  renderControls();
+  return true;
 }
 
 function placeCurvePoint(point, event, anchor) {
@@ -2146,7 +2450,7 @@ function placeCurveAnchor(event, point, anchor) {
   curveCursor = position;
   gesture = {
     type: "curve-anchor", id: event.pointerId, start: raw, position, ending, control: position,
-    startClientX: event.clientX, startClientY: event.clientY, dragged: false,
+    pointer: raw, startClientX: event.clientX, startClientY: event.clientY, dragged: false,
   };
   drawing.setPointerCapture(event.pointerId);
   renderDrawing();
@@ -2156,13 +2460,39 @@ function placeCurveAnchor(event, point, anchor) {
 function resizeSelectedLayer() {
   if (!selection.size || layerDrag.active) return;
   const layer = primaryGeometryLayer();
-  if (!layer || resizeId === layer.id) return;
+  if (layer?.id !== resizeId) showResizeHandles(layer);
+}
+
+function showResizeHandles(layer) {
+  if (!layer) return;
   const { w, h } = shapeFrame(geometryTarget(layer).shape).box;
   if (!w || !h) return;
-  selectForEdit();
-  resizeId = layer.id;
+  if (resizeId !== layer.id) {
+    selectForEdit();
+    resizeId = layer.id;
+  }
   renderDrawing();
   renderControls();
+}
+
+function trackResizeTap(event, layer) {
+  if (!layer || (event.shiftKey && event.button === 0)) return;
+  gesture.resizeTap = {
+    layerId: layer.id, right: event.button === 2,
+    x: event.clientX, y: event.clientY, dragged: false,
+  };
+}
+
+function finishResizeTap({ resizeTap: tap }) {
+  if (!tap || tap.dragged) return false;
+  const layer = layers.find((item) => item.id === tap.layerId && !item.hidden);
+  if (!layer) return false;
+  const { targets } = geometryTarget(layer);
+  if (!selection.has(layer.id) || (!tap.right && [...selection].some((id) => !targets.has(id)))) {
+    selectLayer(layer.id, false, true);
+  }
+  showResizeHandles(layer);
+  return true;
 }
 
 function skewMatrix(box, dx, dy, deltaX, deltaY) {
@@ -2180,8 +2510,12 @@ function skewMatrix(box, dx, dy, deltaX, deltaY) {
 
 function updateResize(proportional) {
   const { start, end, frame: { box, matrix }, dx, dy, shape, skew } = gesture;
-  const minWidth = Math.min(3 / Math.hypot(matrix[0], matrix[1]), box.w);
-  const minHeight = Math.min(3 / Math.hypot(matrix[2], matrix[3]), box.h);
+  const ink = baseInk(shape);
+  const fixedWidth = ink && box.w - ink.width <= guideEpsilon;
+  const fixedHeight = ink && box.h - ink.width <= guideEpsilon;
+  const inkMinimum = ink ? ink.width + .001 : 0;
+  const minWidth = Math.min(Math.max(inkMinimum, 3 / Math.hypot(matrix[0], matrix[1])), box.w);
+  const minHeight = Math.min(Math.max(inkMinimum, 3 / Math.hypot(matrix[2], matrix[3])), box.h);
   const deltaX = end.x - start.x;
   const deltaY = end.y - start.y;
   let w = box.w + dx * deltaX;
@@ -2189,23 +2523,27 @@ function updateResize(proportional) {
   if (skew) {
     const x = dx ? dx * (Math.max(minWidth, w) - box.w) : deltaX;
     const y = dy ? dy * (Math.max(minHeight, h) - box.h) : deltaY;
-    gesture.preview = Math.hypot(x, y) < .001 ? null : {
-      kind: "affine",
-      base: shape.kind === "affine" ? shape.base : shape,
-      matrix: multiplyMatrices(matrix, skewMatrix(box, dx, dy, x, y)),
-    };
+    const skewed = skewMatrix(box, dx, dy, x, y);
+    gesture.preview = Math.hypot(x, y) < .001 ? null : ink
+      ? replaceInk(shape, transformInkGeometry(ink, skewed))
+      : {
+        kind: "affine", base: shape.kind === "affine" ? shape.base : shape,
+        matrix: multiplyMatrices(matrix, skewed),
+      };
     return;
   }
-  if (proportional) {
+  if (proportional || aspectRatioLocked) {
     const projectedScale = dx === 0 ? h / box.h : dy === 0 ? w / box.w
       : (w * box.w + h * box.h) / (box.w ** 2 + box.h ** 2);
-    const scale = Math.max(minWidth / box.w, minHeight / box.h, projectedScale);
+    const scale = Math.max(fixedWidth ? 0 : minWidth / box.w, fixedHeight ? 0 : minHeight / box.h, projectedScale);
     w = scale * box.w;
     h = scale * box.h;
   } else {
     w = Math.max(minWidth, w);
     h = Math.max(minHeight, h);
   }
+  if (fixedWidth) w = box.w;
+  if (fixedHeight) h = box.h;
   if (Math.abs(w - box.w) < .001 && Math.abs(h - box.h) < .001) {
     gesture.preview = null;
     return;
@@ -2215,9 +2553,14 @@ function updateResize(proportional) {
     y: box.y + (box.h - h) * (1 - dy) / 2,
     w, h,
   };
-  gesture.preview = shape.kind === "affine"
-    ? { ...shape, matrix: multiplyMatrices(matrix, scalingMatrix(box, after)) }
-    : scaleShape(shape, box, after);
+  if (ink) {
+    const updated = resizeInkInBox(ink, box, after);
+    gesture.preview = updated === ink ? null : replaceInk(shape, updated);
+  } else {
+    gesture.preview = shape.kind === "affine"
+      ? { ...shape, matrix: multiplyMatrices(matrix, scalingMatrix(box, after)) }
+      : scaleShape(shape, box, after);
+  }
 }
 
 function groupResizeMatrix({ group, preview, frame }) {
@@ -2227,6 +2570,10 @@ function groupResizeMatrix({ group, preview, frame }) {
 
 drawing.addEventListener("pointerdown", (event) => {
   const rightButton = event.button === 2;
+  if (rightButton && cancelLinePlacement()) {
+    event.preventDefault();
+    return;
+  }
   if (gesture || (event.button !== 0 && !rightButton)) return;
   const start = pointAt(event.clientX, event.clientY);
   const inkEndpoint = clickedInkEndpoint(event);
@@ -2235,9 +2582,20 @@ drawing.addEventListener("pointerdown", (event) => {
     queueInkPaint(start, inkBarrierLayers());
     return;
   }
+  if (!rightButton && pendingStraight) {
+    updatePendingStraight(event, start);
+    if (!finishStraightStroke(pendingStraight)) renderDrawing();
+    return;
+  }
+  if (!rightButton && curvePoints.length && isCurveTool(tool)) {
+    placeCurveAnchor(event, start, inkEndpoint?.point ?? clickedGuideEndpoint(event));
+    return;
+  }
+  const selectedHit = rightButton && selection.size > 1
+    ? inkEndpoint?.layer ?? layerAt(start) : null;
   if (rightButton) {
     const guideHandle = event.target.closest("[data-guide-end]");
-    const index = inkEndpoint ? -1
+    const index = inkEndpoint || (!guideHandle && selection.has(selectedHit?.id)) ? -1
       : guideHandle ? Number(guideHandle.dataset.guideIndex) : guideNear(start, guides, guideSnapDistance());
     if (index >= 0) {
       activeGuide = guides[index];
@@ -2327,7 +2685,7 @@ drawing.addEventListener("pointerdown", (event) => {
     return;
   }
   if (rightButton || tool === "select") {
-    const hit = inkEndpoint?.layer ?? layerAt(start);
+    const hit = inkEndpoint?.layer ?? selectedHit ?? layerAt(start);
     if (!rightButton && !hit) {
       gesture = {
         type: "marquee", id: event.pointerId, start, end: start, dragged: false,
@@ -2338,6 +2696,7 @@ drawing.addEventListener("pointerdown", (event) => {
     }
     const fullySelected = hit?.groupId
       ? [...geometryTarget(hit).targets].every((id) => selection.has(id)) : selection.has(hit?.id);
+    const moveSelection = rightButton && selection.size > 1 && fullySelected;
     const additiveClick = !rightButton && event.shiftKey;
     if (rightButton && hit && !fullySelected) {
       selectLayer(hit.id, false, true);
@@ -2345,7 +2704,7 @@ drawing.addEventListener("pointerdown", (event) => {
       selectLayer(hit.id, false, true);
     }
     if (!hit) return;
-    const endpoints = rightButton && !hit.groupId ? inkEndpoints(hit.shape) : null;
+    const endpoints = rightButton && !moveSelection && !hit.groupId ? inkEndpoints(hit.shape) : null;
     const endIndex = endpoints ? inkEndpoint?.index ?? lineEndAt(endpoints, start) : -1;
     if (endIndex >= 0) {
       const point = endpoints[endIndex];
@@ -2356,16 +2715,17 @@ drawing.addEventListener("pointerdown", (event) => {
       });
       const inkMembers = jointMembers(point, strokes);
       if (inkMembers) {
-        beginJointMove(event, start, point, { inkMembers });
+        beginJointMove(event, start, point, { inkMembers, layer: hit });
         return;
       }
       if (baseInk(hit.shape)?.curve) {
-        beginJointMove(event, start, point, { inkMembers: new Map([[hit.id, [endIndex]]]) });
+        beginJointMove(event, start, point, { inkMembers: new Map([[hit.id, [endIndex]]]), layer: hit });
         return;
       }
     }
     const linkedLayer = hit.groupId || hit.inkBoundary || baseInk(hit.shape)?.points.length > 1;
-    const connection = rightButton && linkedLayer ? movementConnections([hit.id]) : null;
+    const connection = rightButton && (linkedLayer || moveSelection)
+      ? movementConnections(moveSelection ? selection : [hit.id]) : null;
     const selectionOnMove = additiveClick && !fullySelected ? geometryTarget(hit).targets : null;
     let targets = rightButton ? connection?.ids ?? new Set([hit.id]) : selectionOnMove ?? new Set(selection);
     if (!rightButton && layers.some((layer) => layer.groupId || layer.inkBoundary)) {
@@ -2382,7 +2742,9 @@ drawing.addEventListener("pointerdown", (event) => {
       type: "move", id: event.pointerId, start, targets, dx: 0, dy: 0,
       rawDx: 0, rawDy: 0, lockAxis: event.shiftKey, disableSnap: event.ctrlKey || event.metaKey,
       clickedLayerId: rightButton ? undefined : hit.id, additiveClick, selectionOnMove,
+      centerLayout: centerMoveReferences(targets),
     };
+    trackResizeTap(event, hit);
     const pointCenter = rightButton ? pointMoveCenter(hit.shape) : null;
     if (connection || pointCenter) {
       const references = sceneStraightLines(undefined, targets);
@@ -2403,14 +2765,21 @@ drawing.addEventListener("pointerdown", (event) => {
       type: "draw", id: event.pointerId, start, end: start,
       startClientX: event.clientX, startClientY: event.clientY, dragged: false,
     };
+    trackResizeTap(event, layerAt(start));
   }
   drawing.setPointerCapture(event.pointerId);
+  if (gesture.resizeTap && !rightButton) renderDrawing();
 });
 
-drawing.addEventListener("contextmenu", (event) => event.preventDefault());
+viewport.addEventListener("contextmenu", (event) => event.preventDefault(), true);
+viewport.addEventListener("mousedown", (event) => {
+  if (event.button === 2 && cancelLinePlacement()) event.preventDefault();
+}, true);
 
 function updateGesture(event) {
   const end = pointAt(event.clientX, event.clientY);
+  const tap = gesture.resizeTap;
+  if (tap) tap.dragged ||= Math.hypot(event.clientX - tap.x, event.clientY - tap.y) > 3;
   if (gesture.type === "draw" || gesture.type === "marquee") {
     gesture.end = gesture.type === "marquee" ? pointOnCanvas(end) : end;
     gesture.dragged ||= Math.hypot(event.clientX - gesture.startClientX, event.clientY - gesture.startClientY) > 3;
@@ -2426,19 +2795,16 @@ function updateGesture(event) {
     gesture.end = pointOnCanvas(end);
     gesture.shiftKey = event.shiftKey;
     updateStrokeStart(gesture, event.ctrlKey || event.metaKey);
-  } else if (gesture.type === "curve-anchor") {
-    const { start, position, ending, startClientX, startClientY } = gesture;
-    gesture.dragged ||= Math.hypot(event.clientX - startClientX, event.clientY - startClientY) > 3;
-    if (gesture.dragged) {
-      const direction = ending ? -1 : 1;
-      gesture.control = { x: position.x + direction * (end.x - start.x), y: position.y + direction * (end.y - start.y) };
-      if (!ending) curveCursor = gesture.control;
+  } else if (gesture.type === "curve-anchor" || gesture.type === "curve-control") {
+    if (gesture.type === "curve-anchor") {
+      gesture.dragged ||= Math.hypot(event.clientX - gesture.startClientX, event.clientY - gesture.startClientY) > 3;
     }
-  } else if (gesture.type === "ink-bend" || gesture.type === "curve-control") {
-    const { start, matrix } = gesture;
-    const anchor = gesture.original ?? gesture.middle;
-    const local = unprojectPoint(matrix, gesture.type === "curve-control" ? end : pointOnCanvas(end));
-    gesture.end = { x: anchor.x + local.x - start.x, y: anchor.y + local.y - start.y };
+    gesture.pointer = end;
+    updateBezierDirection(gesture, event.shiftKey);
+  } else if (gesture.type === "ink-bend") {
+    const { start, middle, matrix } = gesture;
+    const local = unprojectPoint(matrix, pointOnCanvas(end));
+    gesture.end = { x: middle.x + local.x - start.x, y: middle.y + local.y - start.y };
   } else if (gesture.type === "guide-bend") {
     const { start, middle } = gesture;
     gesture.end = pointOnCanvas({ x: middle.x + end.x - start.x, y: middle.y + end.y - start.y });
@@ -2457,8 +2823,10 @@ function updateGesture(event) {
 }
 
 drawing.addEventListener("pointermove", (event) => {
-  if (!gesture && (tool === "curve" || tool === "ink-curve") && curvePoints.length) {
-    curveCursor = pointOnCanvas(pointAt(event.clientX, event.clientY));
+  if (!gesture && (pendingStraight || curvePoints.length)) {
+    const point = pointAt(event.clientX, event.clientY);
+    if (pendingStraight) updatePendingStraight(event, point);
+    else curveCursor = pointOnCanvas(point);
     if (!drawingFrame) drawingFrame = requestAnimationFrame(renderDrawing);
     return;
   }
@@ -2476,6 +2844,7 @@ drawing.addEventListener("pointerup", (event) => {
   delete drawing.dataset.moving;
   delete drawing.dataset.resizing;
   delete drawing.dataset.rotating;
+  if (finishResizeTap(finished)) return;
   if (finished.type === "marquee") {
     finishMarquee(finished, event.shiftKey);
     return;
@@ -2529,6 +2898,7 @@ drawing.addEventListener("pointerup", (event) => {
       }
     }
     renderDrawing();
+    renderControls();
     return;
   }
   if (finished.type === "curve-anchor") {
@@ -2544,35 +2914,24 @@ drawing.addEventListener("pointerup", (event) => {
     renderControls();
     return;
   }
-  if (finished.type === "ink") {
+  if (isStraightTool(finished.type)) {
     const { pointerStart, end, anchorLayerId } = finished;
     if (Math.hypot(end.x - pointerStart.x, end.y - pointerStart.y) < 2) {
+      pendingStraight = { ...finished, end: finished.start };
       if (anchorLayerId !== undefined && !finished.controlKey) selectLayer(anchorLayerId, false);
-      else renderDrawing();
+      else {
+        renderDrawing();
+        renderControls();
+      }
       return;
     }
-    const points = lineStrokePoints(finished);
-    if (points.length === 2) commitInk({ kind: "ink", points, width: finished.width, curve: false });
-    else renderDrawing();
+    if (!finishStraightStroke(finished)) renderDrawing();
     return;
   }
   if (finished.type === "ink-bend") {
     const shape = bentInkShape(finished);
     if (shape !== finished.shape) {
       commit(layers.map((layer) => layer.id === finished.layerId ? { ...layer, shape } : layer));
-    } else {
-      renderDrawing();
-    }
-    return;
-  }
-  if (finished.type === "guide") {
-    if (Math.hypot(finished.end.x - finished.pointerStart.x, finished.end.y - finished.pointerStart.y) < 2) {
-      renderDrawing();
-      return;
-    }
-    const points = lineStrokePoints(finished, true);
-    if (points.length === 2) {
-      commit(layers, selection, [...guides, points]);
     } else {
       renderDrawing();
     }
@@ -2648,14 +3007,15 @@ function cancelGesture() {
   if (!gesture) return;
   const { id } = gesture;
   if (gesture.type === "curve-anchor" && !gesture.ending) clearCurvePlacement();
-  const movingLine = gesture.type === "move" || isSnapMove(gesture) || gesture.type === "line-resize";
+  const updateControls = gesture.type === "move" || isSnapMove(gesture) || gesture.type === "line-resize" ||
+    gesture.type === "curve-anchor" || gesture.type === "curve-control";
   gesture = null;
   delete drawing.dataset.moving;
   delete drawing.dataset.resizing;
   delete drawing.dataset.rotating;
   if (drawing.hasPointerCapture(id)) drawing.releasePointerCapture(id);
   renderDrawing();
-  if (movingLine) renderControls();
+  if (updateControls) renderControls();
 }
 
 drawing.addEventListener("pointercancel", cancelGesture);
@@ -3056,6 +3416,21 @@ byId("layer-paste").addEventListener("click", pasteSelection);
 byId("layer-group").addEventListener("click", groupSelectedLayers);
 byId("layer-ungroup").addEventListener("click", ungroupSelectedLayers);
 
+byId("size-link").addEventListener("click", () => {
+  aspectRatioLocked = !aspectRatioLocked;
+  renderControls();
+});
+
+for (const [id, axis] of [["size-width", "w"], ["size-height", "h"]]) {
+  const input = byId(id);
+  input.addEventListener("change", () => applySize(axis, input));
+  input.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    input.blur();
+  });
+}
+
 byId("palette").innerHTML = colors.map((color) =>
   '<button class="swatch" data-color="' + color + '" style="--swatch:' + color +
   '" aria-label="塗り ' + color.toUpperCase() + '"></button>',
@@ -3164,20 +3539,33 @@ byId("hex").addEventListener("keydown", (event) => {
 
 function renderZoom() {
   const style = getComputedStyle(viewport);
-  const usableWidth = viewport.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
-  const usableHeight = viewport.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
+  const frame = viewport.getBoundingClientRect();
+  const usableWidth = frame.width - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+  const usableHeight = frame.height - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
   const fit = Math.max(.05, Math.min(1, usableWidth / width, usableHeight / height));
   artboard.style.width = width * fit * zoom + "px";
   artboard.style.height = height * fit * zoom + "px";
-  byId("zoom-reset").setAttribute("aria-description", Math.round(zoom * 100) + "%");
+  const percentage = Math.round(zoom * 100) + "%";
+  const reset = byId("zoom-reset");
+  reset.textContent = percentage;
+  reset.setAttribute("aria-label", "表示倍率 " + percentage + " · リセット");
   byId("zoom-out").disabled = zoom <= .25;
   byId("zoom-in").disabled = zoom >= 3;
   if (selection.size || activeGuide || tool === "curve" || tool === "guide" || isInkTool()) renderDrawing();
 }
 
 function setZoom(value) {
-  zoom = Math.max(.25, Math.min(3, Math.round(value * 100) / 100));
+  const next = Math.max(.25, Math.min(3, Math.round(value * 100) / 100));
+  if (next === zoom) return;
+  const frame = viewport.getBoundingClientRect();
+  const before = artboard.getBoundingClientRect();
+  const x = unitInterval((frame.left + viewport.clientWidth / 2 - before.left) / before.width);
+  const y = unitInterval((frame.top + viewport.clientHeight / 2 - before.top) / before.height);
+  zoom = next;
   renderZoom();
+  const after = artboard.getBoundingClientRect();
+  viewport.scrollBy(after.left + x * after.width - frame.left - viewport.clientWidth / 2,
+    after.top + y * after.height - frame.top - viewport.clientHeight / 2);
 }
 
 new ResizeObserver(renderZoom).observe(viewport);
@@ -3187,7 +3575,7 @@ byId("zoom-reset").addEventListener("click", () => setZoom(1));
 byId("new-canvas").addEventListener("click", () => {
   cancelGesture();
   activeGuide = null;
-  clearCurvePlacement();
+  clearLinePlacement();
   commit([], [], []);
 });
 byId("delete").addEventListener("click", removeSelection);
@@ -3252,12 +3640,16 @@ byId("export-png").addEventListener("click", async (event) => {
 const shortcuts = { y: "select", v: "select", a: "text", b: "bucket", p: "guide", c: "curve", n: "ink", q: "ink-curve", r: "rect", o: "ellipse", t: "triangle", d: "diamond" };
 
 function updateShift(equal) {
-  if (gesture?.type === "draw") {
+  if (pendingStraight) {
+    pendingStraight.shiftKey = equal;
+  } else if (gesture?.type === "draw") {
     if (gesture.dragged) gesture.shape = drawnShape(gesture.start, gesture.end, equal);
   } else if (gesture?.type === "resize") {
     gesture.proportional = equal;
   } else if (gesture?.type === "rotate") {
     gesture.snap = equal;
+  } else if (gesture?.type === "curve-anchor" || gesture?.type === "curve-control") {
+    updateBezierDirection(gesture, equal);
   } else if (isStraightTool(gesture?.type)) {
     gesture.shiftKey = equal;
   } else if (gesture?.type === "line-resize") {
@@ -3274,12 +3666,14 @@ function updateShift(equal) {
 
 function updateStrokeControl(event) {
   if (event.key !== "Control" && event.key !== "Meta") return;
-  if (isStraightTool(gesture?.type)) {
+  if (pendingStraight) {
+    pendingStraight.controlKey = event.ctrlKey || event.metaKey;
+  } else if (isStraightTool(gesture?.type)) {
     updateStrokeStart(gesture, event.ctrlKey || event.metaKey);
   } else if (gesture?.type === "line-resize") {
     gesture.disableSnap = event.ctrlKey || event.metaKey;
     updateLineResize();
-  } else if (isSnapMove(gesture)) {
+  } else if (gesture?.type === "move" || isSnapMove(gesture)) {
     gesture.disableSnap = event.ctrlKey || event.metaKey;
     updateSnapMove();
   } else {
@@ -3296,12 +3690,9 @@ document.addEventListener("keydown", (event) => {
   if (event.target.matches?.("input, select, textarea") || event.target.isContentEditable || event.isComposing) return;
   const key = event.key.toLowerCase();
   if (event.key === "Escape") {
+    if (cancelLinePlacement()) return;
     if (gesture) cancelGesture();
-    else if (curvePoints.length) {
-      clearCurvePlacement();
-      renderDrawing();
-      renderControls();
-    } else if (resizeId !== null) {
+    else if (resizeId !== null) {
       resizeId = null;
       renderDrawing();
       renderControls();
@@ -3316,8 +3707,13 @@ document.addEventListener("keydown", (event) => {
     else updateStrokeControl(event);
     return;
   }
+  if (pendingStraight && event.key === "Shift") {
+    updateShift(true);
+    return;
+  }
   if (event.key === "Control" || event.key === "Meta") {
-    if (!event.repeat && !isStraightTool(tool) && !isCurveTool(tool)) resizeSelectedLayer();
+    if (pendingStraight) updateStrokeControl(event);
+    else if (!event.repeat && !isStraightTool(tool) && !isCurveTool(tool)) resizeSelectedLayer();
     return;
   }
   if (event.ctrlKey || event.metaKey) {
