@@ -7,6 +7,9 @@ const unitInterval = (value) => Math.max(0, Math.min(1, value));
 const flattenedCurves = new WeakMap();
 const midpoint = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
 
+const guideIsHidden = (guide) => guide?.kind === "hidden-guide";
+const guideGeometry = (guide) => guideIsHidden(guide) ? guide.base : guide;
+
 function guideCurveControl({ start, middle, end }) {
   const halfChord = midpoint(start, end);
   return { x: 2 * middle.x - halfChord.x, y: 2 * middle.y - halfChord.y };
@@ -17,6 +20,23 @@ function bezierHandles(curve) {
   const control = guideCurveControl(curve);
   return [curve.start, curve.end].map((anchor) =>
     guidePoint(anchor, control.x - anchor.x, control.y - anchor.y, 2 / 3));
+}
+
+function curveBetween(start, controls, end) {
+  return { kind: "curve", start, controls, end, middle: midpoint(start, end) };
+}
+
+function splitBezier(curve, t) {
+  const { start, end } = curve;
+  const [left, right] = bezierHandles(curve);
+  const mix = (a, b) => guidePoint(a, b.x - a.x, b.y - a.y, t);
+  const a = mix(start, left);
+  const b = mix(left, right);
+  const c = mix(right, end);
+  const d = mix(a, b);
+  const e = mix(b, c);
+  const point = mix(d, e);
+  return [curveBetween(start, [a, d], point), curveBetween(point, [e, c], end)];
 }
 
 function curveSegment(curve, pair) {
@@ -35,11 +55,12 @@ function curveWithEndpoint(curve, indices, point) {
   return updated;
 }
 
-function guidePolyline(guide) {
-  if (Array.isArray(guide)) return guide;
-  if (flattenedCurves.has(guide)) return flattenedCurves.get(guide);
+function sampledBezier(guide) {
+  const cached = flattenedCurves.get(guide);
+  if (cached) return cached;
   const points = [guide.start];
-  function flatten(start, left, right, end, depth) {
+  const parameters = [0];
+  function flatten(start, left, right, end, t0, t1, depth) {
     const dx = (end.x - start.x) / 3;
     const dy = (end.y - start.y) / 3;
     if (depth === 12 || Math.max(
@@ -47,6 +68,7 @@ function guidePolyline(guide) {
       Math.hypot(right.x - end.x + dx, right.y - end.y + dy),
     ) <= .18) {
       points.push(end);
+      parameters.push(t1);
       return;
     }
     const a = midpoint(start, left);
@@ -55,13 +77,54 @@ function guidePolyline(guide) {
     const d = midpoint(a, b);
     const e = midpoint(b, c);
     const middle = midpoint(d, e);
-    flatten(start, a, d, middle, depth + 1);
-    flatten(middle, e, c, end, depth + 1);
+    const t = (t0 + t1) / 2;
+    flatten(start, a, d, middle, t0, t, depth + 1);
+    flatten(middle, e, c, end, t, t1, depth + 1);
   }
 
-  flatten(guide.start, ...bezierHandles(guide), guide.end, 0);
-  flattenedCurves.set(guide, points);
-  return points;
+  flatten(guide.start, ...bezierHandles(guide), guide.end, 0, 1, 0);
+  const sample = { points, parameters };
+  flattenedCurves.set(guide, sample);
+  return sample;
+}
+
+function guidePolyline(guide) {
+  if (guideIsHidden(guide)) return [];
+  return Array.isArray(guide) ? guide : sampledBezier(guide).points;
+}
+
+function guideBranchLocation(guide, cursor, limit) {
+  const sample = Array.isArray(guide) ? { points: guide } : sampledBezier(guide);
+  const { points, parameters } = sample;
+  let nearest = null;
+  for (let index = 1; index < points.length; index++) {
+    const start = points[index - 1];
+    const end = points[index];
+    const dx = end.x - start.x;
+    const dy = end.y - start.y;
+    const span = dx * dx + dy * dy;
+    if (!span) continue;
+    const fraction = unitInterval(((cursor.x - start.x) * dx + (cursor.y - start.y) * dy) / span);
+    const point = guidePoint(start, dx, dy, fraction);
+    const distance = Math.hypot(point.x - cursor.x, point.y - cursor.y);
+    if (!nearest || distance < nearest.distance) nearest = { point, index, fraction, distance };
+  }
+  if (!nearest || nearest.distance > limit + .18) return null;
+  const { index, fraction } = nearest;
+  if (parameters) {
+    const parameter = parameters[index - 1] + fraction * (parameters[index] - parameters[index - 1]);
+    if (parameter <= guideEpsilon || parameter >= 1 - guideEpsilon) return null;
+    const pieces = splitBezier(guide, parameter);
+    const point = pieces[0].end;
+    return { point, pieces, distance: Math.hypot(point.x - cursor.x, point.y - cursor.y) };
+  }
+  const { point, distance } = nearest;
+  const left = [...points.slice(0, index)];
+  const right = points.slice(index);
+  if (fraction > guideEpsilon) left.push(point);
+  if (fraction < 1 - guideEpsilon) right.unshift(point);
+  if (left.length < 2 || right.length < 2) return null;
+  return { point, pieces: [left, right], distance };
 }
 
 function guideEndpoint(guide, end) {
@@ -69,6 +132,7 @@ function guideEndpoint(guide, end) {
 }
 
 function moveGuide(guide, dx, dy) {
+  if (guideIsHidden(guide)) return { ...guide, base: moveGuide(guide.base, dx, dy) };
   const offset = ({ x, y }) => ({ x: x + dx, y: y + dy });
   if (Array.isArray(guide)) return guide.map(offset);
   return { ...guide, start: offset(guide.start), middle: offset(guide.middle), end: offset(guide.end),

@@ -110,7 +110,12 @@ function setupLayerDrag(list, onMove) {
     if (drag?.pointerId !== event.pointerId) return;
     if (!drag.placeholder) {
       if (Math.abs(event.clientY - drag.startY) < threshold) return;
-      drag.entries = [...drag.scope.children].filter((entry) => entry.dataset.layerId);
+      drag.entries = [...drag.scope.children].filter((entry) =>
+        entry.dataset.layerId && entry.dataset.guideRow === drag.row.dataset.guideRow);
+      if (drag.entries.length < 2) {
+        finish();
+        return;
+      }
       drag.from = drag.entries.indexOf(drag.row);
       if (drag.from < 0) {
         finish();

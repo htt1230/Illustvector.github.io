@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#f6f7fb">
-  <title>Forma</title>
+  <title>Illustvector</title>
   <link rel="icon" href="logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="style.css">
   <script src="text-fonts.js" defer></script>
@@ -13,16 +13,25 @@
   <script src="bucket-regions.js" defer></script>
   <script src="guide-regions.js" defer></script>
   <script src="ink.js" defer></script>
+  <script src="vendor/paper-core.min.js" defer></script>
+  <script src="vendor/paperjs-offset.min.js" defer></script>
+  <script src="vertex-geometry.js" defer></script>
   <script src="app.js" defer></script>
 </head>
 <body>
   <header class="topbar">
-    <div class="brand"><img src="logo.svg" alt="" width="38" height="38"><span>Forma</span></div>
+    <div class="brand"><img src="brand.svg" alt="Illustvector" width="204" height="40"></div>
     <div class="header-actions">
       <button class="icon-button" id="new-canvas" aria-description="新しいキャンバス" aria-label="新しいキャンバス"><i data-icon="newFile"></i></button>
       <button class="icon-button" id="undo" aria-description="元に戻す（Ctrl+Z）" aria-label="元に戻す" disabled><i data-icon="undo"></i></button>
       <button class="icon-button" id="redo" aria-description="やり直す（Ctrl+Shift+Z）" aria-label="やり直す" disabled><i data-icon="redo"></i></button>
       <button class="export" id="export" aria-label="SVG を保存"><i data-icon="download"></i><span>SVG</span></button>
+      <select id="png-resolution" aria-label="PNGの解像度">
+        <option value="1">760 × 530</option>
+        <option value="2">1520 × 1060</option>
+        <option value="3">2280 × 1590</option>
+        <option value="4">3040 × 2120</option>
+      </select>
       <button class="export export-png" id="export-png" aria-label="PNG を保存"><i data-icon="download"></i><span>PNG</span></button>
     </div>
   </header>
@@ -33,7 +42,13 @@
         <button class="tool" data-tool="select" aria-pressed="true" aria-description="選択（Y / V）" aria-label="選択" aria-keyshortcuts="Y V"><i data-icon="select"></i></button>
         <button class="tool" data-tool="text" aria-pressed="false" aria-description="文字（A）" aria-label="文字"><i data-icon="text"></i></button>
         <button class="tool" data-tool="bucket" aria-pressed="false" aria-description="塗りつぶし（B）" aria-label="塗りつぶし"><i data-icon="bucket"></i></button>
+        <button class="tool" id="text-outline-edit" type="button" aria-label="頂点を編集" aria-pressed="false"><i data-icon="inkCurve"></i></button>
       </section>
+      <div class="vertex-actions" id="vertex-actions" role="group" aria-label="選択した頂点の編集" hidden>
+        <button class="icon-button" type="button" data-vertex-action="y" aria-label="頂点の高さを揃える"><i data-icon="alignVertexY"></i></button>
+        <button class="icon-button" type="button" data-vertex-action="x" aria-label="頂点の左右の位置を揃える"><i data-icon="alignVertexX"></i></button>
+        <button class="icon-button" type="button" data-vertex-action="merge" aria-label="頂点を一つに結合する"><i data-icon="mergeVertices"></i></button>
+      </div>
       <section class="operations shape-tools" aria-label="図形">
         <button class="shape-fill-switch" id="shape-fill" type="button" role="switch" aria-checked="true" aria-label="新しい図形の塗り" aria-description="新しく描く図形の塗りを切り替える">
           <span class="switch-track" aria-hidden="true"><span class="switch-thumb"></span></span>
@@ -80,6 +95,7 @@
               <path id="line-alignment" vector-effect="non-scaling-stroke"/>
               <path id="center-alignment" vector-effect="non-scaling-stroke"/>
               <circle id="endpoint-snap" vector-effect="non-scaling-stroke" visibility="hidden"/>
+              <circle id="branch-snap" vector-effect="non-scaling-stroke" visibility="hidden"/>
               <g id="guide-controls"></g>
             </g>
             <g id="selection-outlines" aria-hidden="true"></g>
@@ -88,6 +104,8 @@
             <g id="resize-handles" aria-hidden="true"></g>
             <g id="rotation-handle" aria-hidden="true"></g>
             <g id="ink-controls" aria-hidden="true"></g>
+            <path id="text-outline-measure" visibility="hidden" pointer-events="none" aria-hidden="true"/>
+            <g id="text-outline-controls" aria-hidden="true"></g>
           </svg>
         </div>
       </div>
@@ -106,8 +124,11 @@
         <h2 id="text-heading" aria-label="文字を追加"><i data-icon="text"></i></h2>
         <form id="text-form">
           <input type="text" id="text-value" maxlength="64" aria-label="文字" required>
-          <select id="text-font" aria-label="書体" hidden></select>
-          <div class="font-options" id="font-options" role="group" aria-label="書体"></div>
+          <div class="text-font-row">
+            <select id="text-font" aria-label="書体"></select>
+            <button class="icon-button" id="font-import" type="button" aria-label="書体ファイルを読み込む（TTF・OTF）"><i data-icon="folder"></i></button>
+            <input type="file" id="font-file" accept=".ttf,.otf" aria-label="書体ファイル" hidden>
+          </div>
           <svg id="text-preview" viewBox="0 0 210 58" aria-hidden="true"></svg>
           <p id="text-message" class="sr-only" role="status" hidden></p>
           <button id="text-submit" type="submit" aria-description="文字を追加" aria-label="文字を追加"><i data-icon="check"></i></button>

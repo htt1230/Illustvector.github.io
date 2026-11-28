@@ -37,40 +37,95 @@ function selectComponent(pixels, width, height, seed, observe) {
   return length;
 }
 
-function componentClip(pixels, width, height, box, pad = .75) {
-  const rectangles = [];
-  let previousRuns = new Map();
+function componentClip(pixels, width, height, box) {
+  const edges = new Map();
   const dx = box.w / width;
   const dy = box.h / height;
   const format = (value) => Number(value.toFixed(3));
-
-  for (let row = 0; row < height; row++) {
-    const runs = new Map();
-    const start = row * width;
-    let column = 0;
-    while (column < width) {
-      if (pixels[start + column] !== 2) {
-        column++;
-        continue;
-      }
-      const left = column;
-      do { column++; } while (column < width && pixels[start + column] === 2);
-      const key = left + ":" + column;
-      const rectangle = previousRuns.get(key) ?? { left, right: column, top: row, bottom: row + 1 };
-      if (rectangle.top === row) rectangles.push(rectangle);
-      rectangle.bottom = row + 1;
-      runs.set(key, rectangle);
-    }
-    previousRuns = runs;
+  const filled = (x, y) => x >= 0 && x < width && y >= 0 && y < height && pixels[y * width + x] === 2;
+  const key = (x, y) => y * (width + 1) + x;
+  function edge(x1, y1, x2, y2) {
+    const start = key(x1, y1);
+    const next = edges.get(start) ?? [];
+    next.push({ x: x2, y: y2 });
+    edges.set(start, next);
   }
-
-  return rectangles.map((rectangle) => {
-    const left = format(box.x + (rectangle.left - pad) * dx);
-    const right = format(box.x + (rectangle.right + pad) * dx);
-    const top = format(box.y + (rectangle.top - pad) * dy);
-    const bottom = format(box.y + (rectangle.bottom + pad) * dy);
-    return "M" + left + " " + top + "H" + right + "V" + bottom + "H" + left + "Z";
-  }).join("");
+  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+    if (!filled(x, y)) continue;
+    if (!filled(x, y - 1)) edge(x, y, x + 1, y);
+    if (!filled(x + 1, y)) edge(x + 1, y, x + 1, y + 1);
+    if (!filled(x, y + 1)) edge(x + 1, y + 1, x, y + 1);
+    if (!filled(x - 1, y)) edge(x, y + 1, x, y);
+  }
+  const paths = [];
+  while (edges.size) {
+    const start = edges.keys().next().value;
+    let current = { x: start % (width + 1), y: Math.floor(start / (width + 1)) };
+    const points = [current];
+    do {
+      const id = key(current.x, current.y);
+      const next = edges.get(id);
+      if (!next?.length) break;
+      current = next.pop();
+      if (!next.length) edges.delete(id);
+      points.push(current);
+    } while (key(current.x, current.y) !== start);
+    if (points.length < 4) continue;
+    // Collapse straight pixel runs before simplifying the remaining contour.
+    const corners = points.filter((p, i) => {
+      if (!i || i === points.length - 1) return true;
+      const a = points[i - 1], b = points[i + 1];
+      return (p.x - a.x) * (b.y - p.y) !== (p.y - a.y) * (b.x - p.x);
+    });
+    const simplified = [corners[0]];
+    let anchor = 0;
+    while (anchor < corners.length - 1) {
+      let end = anchor + 2;
+      for (; end < corners.length; end++) {
+        const a = corners[anchor], b = corners[end];
+        const length = Math.hypot(b.x - a.x, b.y - a.y);
+        if (!length) break;
+        let deviation = 0;
+        for (let i = anchor + 1; i < end; i++) {
+          deviation = Math.max(deviation, Math.abs((b.x - a.x) * (a.y - corners[i].y) -
+            (a.x - corners[i].x) * (b.y - a.y)) / length);
+          if (deviation > .6) break;
+        }
+        if (deviation > .6) break;
+      }
+      anchor = Math.max(anchor + 1, end - 1);
+      simplified.push(corners[anchor]);
+    }
+    if (simplified.length < 4) continue;
+    simplified.pop();
+    if (simplified.length > 12) {
+      try {
+        const fitted = fitBucketContour(simplified, box, dx, dy);
+        if (fitted) {
+          paths.push(fitted);
+          continue;
+        }
+      } catch {
+        // Keep the sampled contour if a curve cannot be fitted.
+      }
+    }
+    const coords = simplified.map((p) => ({ x: box.x + p.x * dx, y: box.y + p.y * dy }));
+    const point = (p) => format(p.x) + " " + format(p.y);
+    const rounded = coords.map((p, i) => {
+      const before = coords[(i + coords.length - 1) % coords.length];
+      const after = coords[(i + 1) % coords.length];
+      const fraction = (other) => Math.min(.18, Math.min(dx, dy) * .5 / Math.hypot(other.x - p.x, other.y - p.y));
+      const toward = (other) => {
+        const t = fraction(other);
+        return { x: p.x + (other.x - p.x) * t, y: p.y + (other.y - p.y) * t };
+      };
+      return { in: toward(before), corner: p, out: toward(after) };
+    });
+    let path = "M" + point(rounded[0].in);
+    for (const p of rounded) path += "L" + point(p.in) + "Q" + point(p.corner) + " " + point(p.out);
+    paths.push(path + "Z");
+  }
+  return paths.join("");
 }
 
 async function rasterizeBucketVector(vector, box, scale) {
@@ -189,6 +244,6 @@ function closedInkRegion(raster, box, point, owners) {
   const localBox = { ...box, x: -left * dx, y: -top * dy };
   return {
     bounds, ids: [...ids].sort((a, b) => a - b),
-    pathData: componentClip(pixels, width, height, localBox, 0),
+    pathData: componentClip(pixels, width, height, localBox),
   };
 }

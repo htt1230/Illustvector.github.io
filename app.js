@@ -13,7 +13,12 @@ const guideSpacingMarks = byId("guide-spacing");
 const lineAlignmentMark = byId("line-alignment");
 const centerAlignmentMark = byId("center-alignment");
 const endpointSnapMark = byId("endpoint-snap");
+const branchSnapMark = byId("branch-snap");
 const inkControls = byId("ink-controls");
+const textOutlineControls = byId("text-outline-controls");
+const textOutlineMeasure = byId("text-outline-measure");
+const textOutlineEditButton = byId("text-outline-edit");
+const vertexActions = byId("vertex-actions");
 const inkWidthInput = byId("ink-width");
 const outlineLayer = byId("selection-outlines");
 const selectionMarquee = byId("selection-marquee");
@@ -42,6 +47,9 @@ const icons = {
   layers: '<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/>',
   strokeWeight: '<path d="M4 5h16" stroke-width="1"/><path d="M4 11h16" stroke-width="2.5"/><path d="M4 18h16" stroke-width="4"/>',
   measureWidth: '<path d="M4 7v10m16-10v10M4 12h16"/>',
+  alignVertexY: '<path d="M3 12h18"/><circle cx="7" cy="12" r="2.5" fill="white"/><circle cx="17" cy="12" r="2.5" fill="white"/>',
+  alignVertexX: '<path d="M12 3v18"/><circle cx="12" cy="7" r="2.5" fill="white"/><circle cx="12" cy="17" r="2.5" fill="white"/>',
+  mergeVertices: '<path d="m4 5 5 5m0-4v4H5m15-5-5 5m0-4v4h4"/><circle cx="12" cy="17" r="2.7"/>',
   measureHeight: '<path d="M7 4h10M7 20h10M12 4v16"/>',
   link: '<path d="m10 8 2-2a4 4 0 0 1 6 6l-2 2m-2 2-2 2a4 4 0 0 1-6-6l2-2m1 5 6-6"/>',
   unlink: '<path d="m13 6 1-1a4 4 0 0 1 6 6l-1 1m-8 6-1 1a4 4 0 0 1-6-6l1-1m3-5-2-2m7 5 2 3m1 4 2 2"/>',
@@ -86,7 +94,10 @@ document.querySelectorAll("[data-icon]").forEach((element) => {
 
 const shapeNames = { rect: "四角形", ellipse: "円・楕円", triangle: "三角形", diamond: "ひし形" };
 const operationNames = { union: "結合", subtract: "切り抜き", intersect: "交差", xor: "除外" };
-const colors = ["#7770e6", "#8cdbb2", "#49afa8", "#ffc66f", "#eb8fa9", "#2e3148"];
+const colors = ["#7770e6", "#8cdbb2", "#49afa8", "#ffc66f", "#eb8fa9", "#2e3148",
+  "#ffffff", "#d9dbe7", "#9298ac", "#535b73", "#ff6b6b", "#f29b5f",
+  "#f4dd70", "#a9d66f", "#5bbd82", "#67cbd1", "#73a9ef", "#ad8be8",
+  "#f2b5ce", "#b77b65", "#7c695f", "#171923"];
 const rect = { kind: "rect", x: 207, y: 108, w: 218, h: 218 };
 const circle = { kind: "ellipse", x: 326, y: 193, w: 226, h: 226 };
 
@@ -98,6 +109,8 @@ let layers = [
 let nextId = 4;
 let guides = [];
 let activeGuide = null;
+const guideRowIds = new WeakMap();
+let nextGuideRowId = -1;
 let cleanLayers = layers;
 let cleanGuides = guides;
 let displayedGuides = null;
@@ -109,7 +122,11 @@ let displayedInkControls = "";
 let curvePoints = [];
 let curveCursor = null;
 let curveStartControl = null;
+let curveBranch = null;
 let pendingStraight = null;
+let branchHover = null;
+let branchCursor = null;
+const inkBranchCache = new WeakMap();
 let facesFromGuides = null;
 let guideFaces = [];
 let inkBarrierCache = null;
@@ -136,11 +153,15 @@ let bucketQueue = Promise.resolve();
 let noticeTimer;
 let textState = null;
 let textPreviewTimer;
+let textPointEdit = null;
+const textPointModels = new WeakMap();
 const undoStack = [];
 const redoStack = [];
 const outlineElements = new Map();
 const artworkElements = new Map();
+const paintedInkCache = new WeakMap();
 const shapeBounds = new WeakMap();
+const regionHitPaths = new WeakMap();
 const strokeHitPaths = new WeakMap();
 let resizeHandleShape = null;
 let resizeHandleSize = 0;
@@ -355,6 +376,15 @@ function outlineContains(shape, width, join, point) {
   }) !== inside);
 }
 
+function regionHitPath(region) {
+  let path = regionHitPaths.get(region);
+  if (!path) {
+    path = new Path2D(region.pathData);
+    regionHitPaths.set(region, path);
+  }
+  return path;
+}
+
 function contains(shape, point, usePathBounds = false) {
   if (shape.kind === "affine") return contains(shape.base, unprojectPoint(shape.matrix, point), usePathBounds);
   if (shape.kind === "outline") return outlineContains(shape.base, shape.width, shape.join, point);
@@ -377,7 +407,10 @@ function contains(shape, point, usePathBounds = false) {
   const u = (point.x - x) / w;
   const v = (point.y - y) / h;
   if (kind === "path" && !usePathBounds) {
-    return pathContext.isPointInPath(shape.hitPath, shape.sourceX + u * shape.sourceW, shape.sourceY + v * shape.sourceH);
+    const px = shape.sourceX + u * shape.sourceW;
+    const py = shape.sourceY + v * shape.sourceH;
+    if (!shape.regions) return pathContext.isPointInPath(shape.hitPath, px, py);
+    return shape.regions.some((region) => pathContext.isPointInPath(regionHitPath(region), px, py));
   }
   if (kind === "ellipse") return (2 * u - 1) ** 2 + (2 * v - 1) ** 2 <= 1;
   if (kind === "triangle") return Math.abs(2 * u - 1) <= v;
@@ -551,10 +584,15 @@ function hasXorColors(xor) {
 
 function hasStoredPaint(shape) {
   const base = shape.kind === "affine" ? shape.base : shape;
+  if (base.kind === "path") return Boolean(base.regions);
   return base.kind === "union" ? Boolean(base.sourceColors) : hasXorColors(rootXor(shape));
 }
 
-function clearXorColors(shape) {
+function clearXorColors(shape, color) {
+  const base = shape.kind === "affine" ? shape.base : shape;
+  if (base.kind === "path" && base.regions) {
+    return replaceRootXor(shape, { ...base, regions: base.regions.map((region) => ({ ...region, color })) });
+  }
   const xor = rootXor(shape);
   return hasXorColors(xor)
     ? replaceRootXor(shape, { ...xor, sourceColors: undefined, paints: undefined, paintOnly: undefined })
@@ -572,6 +610,10 @@ function xorFace(xor, membership) {
 
 function primitive(shape) {
   const { kind } = shape;
+  if (kind === "ink-run") {
+    return '<path d="' + shape.pathData + '" fill="none" stroke="currentColor" stroke-width="' + shape.width +
+      '" stroke-linejoin="round" stroke-linecap="round"/>';
+  }
   if (kind === "ink") {
     if (shape.points.length === 1) {
       const [point] = shape.points;
@@ -603,9 +645,59 @@ function strokeAttributes(color, width, join = "round") {
   return ' stroke="' + color + '" stroke-width="' + width + '" stroke-linejoin="' + join + '"';
 }
 
+function paintedInkRuns(items, targets) {
+  if (!items.some((layer) => layer.inkChain)) return items;
+  const result = [];
+  function continues(left, right) {
+    if (!left.inkChain || left.inkChain !== right.inkChain || left.color !== right.color ||
+      Boolean(left.noFill) !== Boolean(right.noFill) || (left.opacity ?? 100) !== (right.opacity ?? 100) ||
+      Boolean(targets?.has(left.id)) !== Boolean(targets?.has(right.id))) return false;
+    const stroke = left.stroke ?? defaultStroke;
+    const otherStroke = right.stroke ?? defaultStroke;
+    if (stroke.enabled !== otherStroke.enabled || (stroke.enabled &&
+      (stroke.color !== otherStroke.color || stroke.width !== otherStroke.width ||
+        (stroke.join ?? "round") !== (otherStroke.join ?? "round")))) return false;
+    const a = inkEndpoints(left.shape);
+    const b = inkEndpoints(right.shape);
+    return a && b && baseInk(left.shape).width === baseInk(right.shape).width &&
+      endpointKey(a[1]) === endpointKey(b[0]);
+  }
+
+  for (let start = 0; start < items.length;) {
+    let end = start + 1;
+    while (end < items.length && continues(items[end - 1], items[end])) end++;
+    const first = items[start];
+    if (end === start + 1) {
+      result.push(first);
+    } else {
+      const run = items.slice(start, end);
+      const cached = paintedInkCache.get(first);
+      if (cached?.run.length === run.length && run.every((layer, index) => layer === cached.run[index])) {
+        result.push(cached.item);
+      } else {
+        const strokes = run.map((layer) => inkInWorld(layer.shape));
+        const pathData = strokes.map((stroke, index) => index === 0 ? inkPathData(stroke)
+          : inkPathData(stroke).replace(/^M[^LCQ]*/, "")).join("");
+        const boxes = strokes.map((stroke) => inkBounds(stroke));
+        const x = Math.min(...boxes.map((box) => box.x));
+        const y = Math.min(...boxes.map((box) => box.y));
+        const w = Math.max(...boxes.map((box) => box.x + box.w)) - x;
+        const h = Math.max(...boxes.map((box) => box.y + box.h)) - y;
+        const shape = { kind: "ink-run", pathData, width: strokes[0].width, x, y, w, h };
+        const item = { ...first, inkChain: undefined, shape };
+        paintedInkCache.set(first, { run, item });
+        result.push(item);
+      }
+    }
+    start = end;
+  }
+  return result;
+}
+
 function renderVector(items, prefix) {
   const definitions = [];
   const compiled = new WeakMap();
+  const parityPairs = new Map();
   let sequence = 0;
   const newId = () => prefix + "-" + ++sequence;
   const use = (id, fill = "") => '<use href="#' + id + '"' + (fill ? ' fill="' + fill + '" color="' + fill + '"' : "") + '/>';
@@ -617,14 +709,56 @@ function renderVector(items, prefix) {
     return id;
   }
 
-  function mask(content, box) {
+  function mask(content, box, invert = false) {
     const id = newId();
+    const region = ' x="' + number(box.x - 2) + '" y="' + number(box.y - 2) +
+      '" width="' + number(box.w + 4) + '" height="' + number(box.h + 4) + '"';
     definitions.push(
-      '<mask id="' + id + '" maskUnits="userSpaceOnUse" x="' + number(box.x - 2) +
-      '" y="' + number(box.y - 2) + '" width="' + number(box.w + 4) + '" height="' + number(box.h + 4) +
-      '" style="mask-type:luminance">' + content + '</mask>',
+      '<mask id="' + id + '" maskUnits="userSpaceOnUse"' + region + ' style="mask-type:luminance">' +
+      (invert ? '<rect' + region + ' fill="white"/>' : '') + content + '</mask>',
     );
     return id;
+  }
+
+  function cutOut(content, cutters, box) {
+    if (!cutters.length) return content;
+    // Let the source supply its own edge coverage. The mask only removes cutters.
+    return masked(mask(cutters.map((id) => use(id, "black")).join(""), box, true), content);
+  }
+
+  function boxesOverlap(a, b) {
+    return a.x <= b.x + b.w && b.x <= a.x + a.w && a.y <= b.y + b.h && b.y <= a.y + a.h;
+  }
+
+  function xorParity(parts, omitted = -1, area = null) {
+    function range(start, end) {
+      if (end - start === 1) {
+        if (start === omitted) return null;
+        const part = parts[start];
+        const box = bounds(part);
+        return area && !boxesOverlap(box, area) ? null : { id: compile(part), box };
+      }
+      const middle = start + Math.floor((end - start) / 2);
+      const left = range(start, middle);
+      const right = range(middle, end);
+      if (!left || !right) return left ?? right;
+
+      const key = left.id + " " + right.id;
+      if (!parityPairs.has(key)) {
+        const a = left.box;
+        const b = right.box;
+        const x = Math.min(a.x, b.x);
+        const y = Math.min(a.y, b.y);
+        const w = Math.max(a.x + a.w, b.x + b.w) - x;
+        const h = Math.max(a.y + a.h, b.y + b.h) - y;
+        const content = boxesOverlap(a, b)
+          ? cutOut(use(left.id), [right.id], a) + cutOut(use(right.id), [left.id], b)
+          : use(left.id) + use(right.id);
+        parityPairs.set(key, { id: group(content), box: { x, y, w, h } });
+      }
+      return parityPairs.get(key);
+    }
+    return parts.length ? range(0, parts.length) : null;
   }
 
   function outlineFilter(shape, stroke) {
@@ -695,32 +829,24 @@ function renderVector(items, prefix) {
     if (shape.kind === "affine") {
       return group('<g transform="matrix(' + shape.matrix.join(" ") + ')">' + use(compile(shape.base)) + '</g>');
     }
-    if (!shape.parts) return group(primitive(shape));
+    if (!shape.parts) {
+      const content = shape.regions ? shape.regions.map(({ pathData }) => primitive({ ...shape, pathData })).join("")
+        : primitive(shape);
+      return group(content);
+    }
     if (shape.kind === "union") {
       const content = [];
       appendUnionPart(shape, content);
       return group(content.join(""));
     }
+    if (shape.kind === "xor") return xorParity(shape.parts).id;
     const parts = shape.parts.map(compile);
     const box = bounds(shape);
     if (shape.kind === "subtract") {
-      const silhouette = mask(use(parts[0], "white") + parts.slice(1).map((id) => use(id, "black")).join(""), box);
-      return group(masked(silhouette, use(parts[0])));
+      return group(cutOut(use(parts[0]), parts.slice(1), box));
     }
-    if (shape.kind === "intersect") {
-      const content = parts.slice(1).reduce((result, id) => masked(mask(use(id, "white"), box), result), use(parts[0]));
-      return group(content);
-    }
-    function parity(start, end) {
-      if (end - start === 1) return parts[start];
-      const middle = start + Math.floor((end - start) / 2);
-      const left = parity(start, middle);
-      const right = parity(middle, end);
-      const keepLeft = mask(use(left, "white") + use(right, "black"), box);
-      const keepRight = mask(use(right, "white") + use(left, "black"), box);
-      return group(masked(keepLeft, use(left)) + masked(keepRight, use(right)));
-    }
-    return parity(0, parts.length);
+    const content = parts.slice(1).reduce((result, id) => masked(mask(use(id, "white"), box), result), use(parts[0]));
+    return group(content);
   }
 
   function renderXorColors(xor) {
@@ -729,24 +855,24 @@ function renderVector(items, prefix) {
       xor.parts.every((part) => !hasStoredPaint(part))) {
       return use(compile(xor), firstColor);
     }
-    if (xor.parts.length === 2) {
-      return xor.parts.map((source, index) => {
-        const face = xorFace(xor, [index]);
-        const color = xor.sourceColors[index];
-        if (!hasStoredPaint(source)) return use(compile(face), color);
-        const region = mask(use(compile(face), "white"), bounds(face));
-        return masked(region, renderFill(source, color));
-      }).join("");
-    }
-
-    // The highest source at any point supplies the color of its odd-parity region.
-    const content = xor.parts.map((part, index) => renderFill(part, xor.sourceColors[index])).join("");
-    const region = mask(use(compile(xor), "white"), bounds(xor));
-    return masked(region, content);
+    // Inside a source, total parity is odd exactly when the other sources have even parity.
+    // Draw in layer order so overlapping odd regions keep the highest visible color.
+    return xor.parts.map((source, index) => {
+      const box = bounds(source);
+      const others = xorParity(xor.parts, index, box);
+      const content = renderFill(source, xor.sourceColors[index]);
+      return others ? cutOut(content, [others.id], box) : content;
+    }).join("");
   }
 
   function renderFill(shape, color) {
     const base = shape.kind === "affine" ? shape.base : shape;
+    if (base.kind === "path" && base.regions) {
+      const content = base.regions.map((region) =>
+        '<g fill="' + region.color + '">' + primitive({ ...base, pathData: region.pathData }) + '</g>',
+      ).join("");
+      return shape.kind === "affine" ? '<g transform="matrix(' + shape.matrix.join(" ") + ')">' + content + '</g>' : content;
+    }
     if (base.kind === "union" && base.sourceColors) {
       const content = base.parts.map((part, index) => renderFill(part, base.sourceColors[index])).join("");
       return shape.kind === "affine" ? '<g transform="matrix(' + shape.matrix.join(" ") + ')">' + content + '</g>' : content;
@@ -757,6 +883,10 @@ function renderVector(items, prefix) {
     let fill = "";
     if (!xor.paintOnly) fill = xor.sourceColors ? renderXorColors(xor) : use(compile(xor), color);
     for (const paint of xor.paints ?? []) {
+      if (paint.outline) {
+        fill += '<path d="' + paint.outline + '" fill="' + paint.color + '"/>';
+        continue;
+      }
       const part = use(compile(xorFace(xor, paint.membership)), paint.color);
       if (paint.clip) {
         const clipId = newId();
@@ -771,7 +901,8 @@ function renderVector(items, prefix) {
 
   function renderItem({ shape, color, noFill, stroke = defaultStroke }) {
     if (noFill && !stroke.enabled) return "";
-    if (!shape.parts && shape.kind !== "affine" && shape.kind !== "outline" && shape.kind !== "ink" && (shape.kind !== "path" || !stroke.enabled)) {
+    if (!shape.parts && !shape.regions && !["affine", "outline", "ink", "ink-run"].includes(shape.kind) &&
+      (shape.kind !== "path" || !stroke.enabled)) {
       const line = stroke.enabled ? strokeAttributes(stroke.color, stroke.width, stroke.join) : "";
       return '<g fill="' + (noFill ? "none" : color) + '"' + line + '>' + primitive(shape) + '</g>';
     }
@@ -786,7 +917,7 @@ function renderVector(items, prefix) {
     const filter = outlineFilter(shape, stroke);
     return fill + '<g filter="url(#' + filter + ')">' + use(compile(shape), "white") + '</g>';
   }
-  const content = items.map((item) => {
+  const content = paintedInkRuns(items).map((item) => {
     const vector = renderItem(item);
     const opacity = item.opacity ?? 100;
     return vector && opacity !== 100 ? '<g opacity="' + opacity / 100 + '">' + vector + '</g>' : vector;
@@ -805,7 +936,7 @@ function setPreviewTransform(node, transform) {
 function renderArtwork(visible, targets, transform) {
   const liveIds = new Set();
   let cursor = artwork.firstElementChild;
-  for (const layer of visible) {
+  for (const layer of paintedInkRuns(visible, targets)) {
     liveIds.add(layer.id);
     let entry = artworkElements.get(layer.id);
     if (!entry) {
@@ -836,6 +967,7 @@ function renderOutlines(visible, targets, transform, handleLayerId) {
   const resizeGroup = visible.find((layer) => layer.id === handleLayerId)?.groupId;
   const liveIds = new Set();
   for (const layer of visible) {
+    if (layer.id === textPointEdit?.layerId) continue;
     if (!selection.has(layer.id) && !(primaryGroup && layer.groupId === primaryGroup)) continue;
     const id = layer.groupId ?? layer.id;
     if (liveIds.has(id)) continue;
@@ -869,6 +1001,17 @@ function renderDrawing() {
   if (drawingFrame) cancelAnimationFrame(drawingFrame);
   drawingFrame = 0;
   let visible = layers.filter((layer) => !layer.hidden);
+  const pointLayer = textPointEdit && editableTextPointLayer();
+  if (textPointEdit && pointLayer?.id !== textPointEdit.layerId) {
+    textPointEdit.layerId = pointLayer?.id;
+    textPointEdit.selected.clear();
+  }
+  if (gesture?.type === "text-point" && pointLayer?.id === gesture.layerId) {
+    const shape = movedTextOutline(gesture);
+    if (shape !== pointLayer.shape) {
+      visible = visible.map((layer) => layer === pointLayer ? { ...layer, shape } : layer);
+    }
+  }
   const movement = gesture?.type === "move" ? gesture : null;
   const rotation = gesture?.type === "rotate" ? rotationMatrix(gesture) : null;
   let targets = movement?.targets ?? (rotation ? gesture.targets : null);
@@ -920,7 +1063,7 @@ function renderDrawing() {
   }
   if (colorPreview) {
     visible = visible.map((layer) => selection.has(layer.id)
-      ? { ...layer, color: colorPreview, shape: clearXorColors(layer.shape) } : layer);
+      ? { ...layer, color: colorPreview, shape: clearXorColors(layer.shape, colorPreview) } : layer);
   }
   if (strokePreview) {
     visible = visible.map((layer) => selection.has(layer.id) ? {
@@ -933,7 +1076,7 @@ function renderDrawing() {
   renderArtwork(visible, artworkTargets ?? targets, transform);
   renderGuides();
   const tap = gesture?.resizeTap;
-  const handleLayerId = tap && !tap.right && !tap.dragged ? tap.layerId : resizeId;
+  const handleLayerId = textPointEdit ? null : (tap && !tap.right && !tap.dragged ? tap.layerId : resizeId);
   renderOutlines(visible, targets, transform, handleLayerId);
   renderSelectionMarquee();
   const resizedLayer = visible.find((layer) => layer.id === handleLayerId);
@@ -943,12 +1086,17 @@ function renderDrawing() {
   const selectedLayer = visible.find((layer) => layer.id === primaryId);
   const selectedShape = selectedLayer?.groupId ? geometryTarget(selectedLayer).shape : selectedLayer?.shape;
   const selectedTransform = targets?.has(selectedLayer?.id) ? transform : null;
-  renderRotationHandle(selectedShape, selectedTransform);
+  renderRotationHandle(textPointEdit ? null : selectedShape, selectedTransform);
   renderInkControls(visible, artworkTargets ?? targets, transform);
+  renderTextOutlineControls(!movement && pointLayer && visible.find((layer) => layer.id === pointLayer.id));
+  vertexActions.hidden = !textPointEdit;
+  for (const button of vertexActions.querySelectorAll("button")) {
+    button.disabled = Boolean(gesture) || (textPointEdit?.selected.size ?? 0) < 2;
+  }
 }
 
 function renderSelectionMarquee() {
-  if (gesture?.type !== "marquee" || !gesture.dragged) {
+  if (!gesture?.dragged || (gesture.type !== "marquee" && gesture.type !== "text-point-marquee")) {
     selectionMarquee.removeAttribute("width");
     return;
   }
@@ -1025,7 +1173,7 @@ function renderInkControls(visible, targets, transform) {
 function renderGuides() {
   const coordinates = (points) => points.map(({ x, y }) => number(x) + "," + number(y)).join(" ");
   if (displayedGuides !== guides) {
-    guideLines.innerHTML = guides.map((guide) => Array.isArray(guide)
+    guideLines.innerHTML = guides.map((guide) => guideIsHidden(guide) ? "<g/>" : Array.isArray(guide)
       ? '<polyline points="' + coordinates(guide) + '" vector-effect="non-scaling-stroke"/>'
       : '<path d="' + curvePath(guide) + '" vector-effect="non-scaling-stroke"/>',
     ).join("");
@@ -1042,7 +1190,7 @@ function renderGuides() {
     for (const index of new Set([...jointGuideIndices, ...(previews?.keys() ?? [])])) {
       const guide = previews?.get(index) ?? guides[index];
       const node = guideLines.children[index];
-      if (node) {
+      if (node && !guideIsHidden(guide)) {
         if (Array.isArray(guide)) node.setAttribute("points", coordinates(guide));
         else node.setAttribute("d", curvePath(guide));
       }
@@ -1088,6 +1236,12 @@ function renderGuides() {
   renderCenterAlignment(gesture?.centerHint);
   const startSnap = stroke && (stroke === pendingStraight || stroke.start !== stroke.pointerStart) ? stroke.start : null;
   renderEndpointSnap(end?.endpoint ?? gesture?.endpointSnap ?? startSnap);
+  branchSnapMark.setAttribute("visibility", branchHover ? "visible" : "hidden");
+  if (branchHover) {
+    branchSnapMark.setAttribute("cx", number(branchHover.point.x));
+    branchSnapMark.setAttribute("cy", number(branchHover.point.y));
+    branchSnapMark.setAttribute("r", number(4 * svgUnitsPerPixel()));
+  }
 
   const [start, middle] = curvePoints;
   if (bend) {
@@ -1200,7 +1354,7 @@ function renderGuideControls(bendIndex, bentGuide, movement, resize, previews) {
     const handles = [];
     const endpoints = new Map();
     guides.forEach((guide, index) => {
-      if (!showAll && guide !== activeGuide) return;
+      if (guideIsHidden(guide) || (!showAll && guide !== activeGuide)) return;
       const offset = (point) => movement?.indices.has(index)
         ? { x: point.x + movement.dx, y: point.y + movement.dy } : point;
       const current = index === bendIndex ? bentGuide : previews?.get(index) ?? guide;
@@ -1313,8 +1467,7 @@ function layerBlocks(source = layers) {
   return [...blocks.values()];
 }
 
-function layerRowActions(id, name, hidden, group = false) {
-  const suffix = group ? "-group" : "";
+function layerRowActions(id, name, hidden, suffix = "") {
   const visibility = hidden ? "表示" : "非表示";
   return '<button class="icon-button" data-visibility' + suffix + '="' + id + '" aria-label="' + name + 'を' +
     visibility + '">' + icon(hidden ? "eyeOff" : "eye") + '</button>' +
@@ -1322,27 +1475,78 @@ function layerRowActions(id, name, hidden, group = false) {
     'を削除">' + icon("trash") + '</button>';
 }
 
+function guideRowId(guide) {
+  if (!guideRowIds.has(guide)) guideRowIds.set(guide, nextGuideRowId--);
+  return guideRowIds.get(guide);
+}
+
+function guideRowIndex(id) {
+  return guides.findIndex((guide) => guideRowId(guide) === id);
+}
+
+function replaceGuideRow(before, after) {
+  guideRowIds.set(after, guideRowId(before));
+  return after;
+}
+
+function layerThumbnail(box, content, padding = 0) {
+  const side = Math.max(box.w, box.h, 1) + padding;
+  const viewBox = [box.x + (box.w - side) / 2 - side * .16, box.y + (box.h - side) / 2 - side * .16,
+    side * 1.32, side * 1.32].map(number).join(" ");
+  return '<svg class="layer-preview" viewBox="' + viewBox + '" aria-hidden="true">' + content + '</svg>';
+}
+
+function layerTypeIcon(layer) {
+  if (layer.text) return "text";
+  const shape = layer.shape.kind === "affine" ? layer.shape.base : layer.shape;
+  if (shape.kind === "ink") return shape.curve ? "inkCurve" : "ink";
+  if (shape.kind === "path") return layer.inkBoundary ? "bucket" : "curve";
+  if (shape.kind === "outline") return "strokeWeight";
+  return Object.hasOwn(icons, shape.kind) ? shape.kind : "layers";
+}
+
+function layerTypeMark(mark) {
+  return '<i class="layer-type" aria-hidden="true">' + icon(mark) + '</i>';
+}
+
 function renderLayers() {
   layerDrag.cancel();
   const blocks = layerBlocks();
-  byId("layer-count").textContent = blocks.length;
+  byId("layer-count").textContent = blocks.length + guides.length;
   const primary = primarySelectionId();
   const groupIds = blocks.filter((block) => block.group).map((block) => block.id).sort((a, b) => a - b);
   const groupLabels = new Map(groupIds.map((id, index) => [id, "グループ" + (index + 1)]));
   const grip = '<i class="layer-grip" aria-hidden="true">' + icon("grip") + '</i>';
   function renderLayer(layer) {
     const active = selection.has(layer.id);
-    const box = bounds(layer.shape);
-    const side = Math.max(box.w, box.h, 1) + (layer.stroke?.enabled ? layer.stroke.width : 0);
-    const viewBox = [box.x + (box.w - side) / 2 - side * .16, box.y + (box.h - side) / 2 - side * .16, side * 1.32, side * 1.32].map(number).join(" ");
-    const preview = '<svg class="layer-preview" viewBox="' + viewBox + '" aria-hidden="true">' +
-      renderVector([layer], "preview-" + layer.id) + '</svg>';
+    const preview = layerThumbnail(bounds(layer.shape), renderVector([layer], "preview-" + layer.id),
+      layer.stroke?.enabled ? layer.stroke.width : 0);
     const selectionClass = layer.id === primary ? " selected" : active ? " selected secondary-selection" : "";
     const name = escapeMarkup(layer.name);
     return '<div class="layer' + selectionClass + (layer.hidden ? " hidden" : "") + '" data-layer-id="' + layer.id + '">' +
       '<button class="layer-select" data-layer="' + layer.id + '" aria-pressed="' + active + '">' +
-      grip + preview + '<span class="sr-only">' + name + '</span></button>' +
+      grip + preview + layerTypeMark(layerTypeIcon(layer)) + '<span class="sr-only">' + name + '</span></button>' +
       layerRowActions(layer.id, name, layer.hidden) + '</div>';
+  }
+  function renderGuideLayer(guide) {
+    const id = guideRowId(guide);
+    const hidden = guideIsHidden(guide);
+    const active = guide === activeGuide;
+    const geometry = guideGeometry(guide);
+    const curved = !Array.isArray(geometry);
+    const points = guidePolyline(geometry);
+    const x = Math.min(...points.map((point) => point.x));
+    const y = Math.min(...points.map((point) => point.y));
+    const box = { x, y, w: Math.max(...points.map((point) => point.x)) - x, h: Math.max(...points.map((point) => point.y)) - y };
+    const attributes = ' class="layer-guide-stroke" vector-effect="non-scaling-stroke"';
+    const content = curved ? '<path d="' + curvePath(geometry) + '"' + attributes + '/>'
+      : '<polyline points="' + points.map(({ x, y }) => number(x) + "," + number(y)).join(" ") + '"' + attributes + '/>';
+    const name = curved ? "曲線の点線" : "直線の点線";
+    return '<div class="layer' + (active ? " selected" : "") + (hidden ? " hidden" : "") +
+      '" data-layer-id="' + id + '" data-guide-row>' +
+      '<button class="layer-select" data-guide-layer="' + id + '" aria-pressed="' + active + '">' +
+      grip + layerThumbnail(box, content) + layerTypeMark(curved ? "curve" : "guide") +
+      '<span class="sr-only">' + name + '</span></button>' + layerRowActions(id, name, hidden, "-guide") + '</div>';
   }
   function renderBlock({ id, group, members }) {
     if (!group) return renderLayer(members[0]);
@@ -1351,17 +1555,20 @@ function renderLayers() {
     const active = members.every((layer) => selection.has(layer.id));
     const partial = !active && members.some((layer) => selection.has(layer.id));
     const hidden = members.every((layer) => layer.hidden);
+    const visible = hidden ? members : members.filter((layer) => !layer.hidden);
+    const preview = layerThumbnail(geometryTarget(members[0]).shape, renderVector(visible, "group-preview-" + id));
     const selectionClass = active ? " selected" : partial ? " selected secondary-selection" : "";
     return '<div class="layer-block" data-layer-id="' + id + '"><div class="layer' + selectionClass + (hidden ? " hidden" : "") + '">' +
       '<button class="icon-button layer-expand" data-expand-group="' + id + '" aria-expanded="' + open +
       '" aria-controls="layer-members-' + id + '" aria-label="' + name + 'の内訳">' + icon(open ? "chevronDown" : "chevronRight") + '</button>' +
       '<button class="layer-select" data-layer-group="' + id + '" aria-pressed="' + (partial ? "mixed" : active) + '">' +
-      grip + '<i class="layer-group-symbol">' + icon("layers") + '</i><span class="sr-only">' + name +
-      '</span></button>' + layerRowActions(id, name, hidden, true) + '</div>' +
+      grip + preview + layerTypeMark("layers") + '<span class="sr-only">' + name +
+      '</span></button>' + layerRowActions(id, name, hidden, "-group") + '</div>' +
       '<div class="layer-members" id="layer-members-' + id + '"' + (open ? "" : " hidden") + '>' +
       (open ? members.slice().reverse().map(renderLayer).join("") : "") + '</div></div>';
   }
-  layerList.innerHTML = blocks.length ? blocks.reverse().map(renderBlock).join("")
+  layerList.innerHTML = blocks.length || guides.length
+    ? guides.slice().reverse().map(renderGuideLayer).join("") + blocks.reverse().map(renderBlock).join("")
     : '<div class="empty">' + icon("layers") + '<span class="sr-only">図形がありません</span></div>';
 }
 
@@ -1369,7 +1576,10 @@ function renderControls() {
   drawing.dataset.tool = tool;
   shapeFillSwitch.setAttribute("aria-checked", shapeFillEnabled);
   shapeFillSwitch.parentElement.style.setProperty("--shape-ink", brush);
-  document.querySelectorAll("[data-tool]").forEach((button) => button.setAttribute("aria-pressed", button.dataset.tool === tool));
+  document.querySelectorAll("[data-tool]").forEach((button) => {
+    button.setAttribute("aria-pressed", !textPointEdit && button.dataset.tool === tool);
+  });
+  textOutlineEditButton.setAttribute("aria-pressed", Boolean(textPointEdit));
   const operandCount = selectedOperandBlocks().length;
   document.querySelectorAll("[data-operation]").forEach((button) => {
     button.disabled = operandCount < 2;
@@ -1377,11 +1587,13 @@ function renderControls() {
   byId("new-canvas").disabled = !layers.length && !guides.length;
   byId("undo").disabled = !undoStack.length;
   byId("redo").disabled = !redoStack.length;
-  byId("delete").disabled = !selection.size;
+  byId("delete").disabled = !selection.size && !activeGuide;
   byId("layer-copy").disabled = !selection.size && !activeGuide;
   byId("layer-paste").disabled = !copiedObjects;
   let hint = "クリックで拡縮ハンドル · 空白からドラッグで範囲選択 · Shift で追加 · 右ドラッグで移動";
-  if (gesture?.type === "curve-control" || gesture?.type === "curve-anchor") hint = "Shift でベジェハンドルを45°刻み";
+  if (textPointEdit) hint = "図形をクリック · ドラッグで頂点を範囲選択 · Delete で頂点を削除 · Ctrl で吸着解除";
+  else if (gesture?.type === "curve-control") hint = "縦・横で点をそろえて吸着 · Shift で45°刻み · Ctrl で吸着解除";
+  else if (gesture?.type === "curve-anchor") hint = "Shift でベジェハンドルを45°刻み";
   else if (gesture?.type === "joint-move") hint = "接続点を移動 · 上下の線の中間で吸着 · Ctrl で吸着解除";
   else if (gesture?.type === "line-resize") hint = "端点で長さと角度を変更 · Shift で15°刻み · Ctrl で吸着解除";
   else if (isSnapMove(gesture)) hint = gesture.pointRows?.length >= 2
@@ -1392,8 +1604,8 @@ function renderControls() {
   else if (gesture?.type === "move") hint = "中心をそろえて吸着 · Shift で45°刻み · Ctrl で吸着解除";
   else if (resizeId !== null) hint = "角・辺中央で拡縮 · 辺をドラッグして変形 · Shift で比率固定";
   else if (pendingStraight) hint = "終点をクリック · 右クリックでキャンセル · Shift で15°刻み";
-  else if (tool === "guide") hint = "2回のクリックまたはドラッグで直線 · Shift で15°刻み · Ctrl で吸着解除";
-  else if (tool === "ink") hint = "2回のクリックまたはドラッグで直線 · Alt＋クリックで塗る · Ctrl で吸着解除";
+  else if (tool === "guide") hint = "2回のクリックまたはドラッグで直線 · 線の途中の丸から分岐 · Ctrl で吸着解除";
+  else if (tool === "ink") hint = "2回のクリックまたはドラッグで直線 · 線の途中の丸から分岐 · Ctrl で吸着解除";
   else if (tool === "curve" || tool === "ink-curve") {
     const startHint = "始点・中点・終点をクリック · 始点からドラッグでベジェ · Shift で45°刻み";
     hint = curveStartControl ? "終点をクリックまたはドラッグ" : [startHint, "中点をクリック", "終点をクリック"][curvePoints.length];
@@ -1500,11 +1712,15 @@ function restore(from, to) {
 }
 
 function chooseTool(value) {
-  if (tool === value) return;
+  if (tool === value) {
+    if (value === "select" && textPointEdit && !gesture) setTextPointEdit(null);
+    return;
+  }
   cancelGesture();
   activeGuide = null;
   clearLinePlacement();
   resizeId = null;
+  textPointEdit = null;
   if (value !== "select") selection.clear();
   tool = value;
   render();
@@ -1512,7 +1728,7 @@ function chooseTool(value) {
 }
 
 function selectForEdit() {
-  if (!Object.hasOwn(shapeNames, tool) && !isInkTool()) chooseTool("select");
+  if (tool !== "select" && !Object.hasOwn(shapeNames, tool) && !isInkTool()) chooseTool("select");
 }
 
 function isInkTool() {
@@ -1532,9 +1748,14 @@ function inkLayerStyle(shape) {
   return { shape, color: brush, opacity: opacityPreview ?? opacityBrush };
 }
 
-function commitInk(shape) {
+function commitInk(shape, branch) {
+  const scene = splitBranchParent(branch);
   const id = nextId++;
-  commit([...layers, { id, name: shape.curve ? "鉛筆の曲線" : "鉛筆の直線", ...inkLayerStyle(shape) }], [id]);
+  const layer = { id, name: shape.curve ? "鉛筆の曲線" : "鉛筆の直線",
+    ...inkLayerStyle(shape), ...(scene.groupId ? { groupId: scene.groupId } : {}),
+  };
+  const index = scene.groupId ? scene.layers.findLastIndex((member) => member.groupId === scene.groupId) + 1 : scene.layers.length;
+  commit([...scene.layers.slice(0, index), layer, ...scene.layers.slice(index)], [id], scene.guides);
 }
 
 function bentInkShape({ shape, end }) {
@@ -1544,15 +1765,29 @@ function bentInkShape({ shape, end }) {
   return replaceInk(shape, { ...ink, points: [start, end, finish] });
 }
 
-function startInkBend(layer, point, pointerId) {
+function startInkBend(layer, point, event) {
   const shape = layer.shape;
   const matrix = shape.kind === "affine" ? shape.matrix : identityMatrix;
   const middle = baseInk(shape).points[1];
   gesture = {
-    type: "ink-bend", id: pointerId, layerId: layer.id, shape, matrix,
-    start: unprojectPoint(matrix, point), middle, end: middle,
+    type: "ink-bend", id: event.pointerId, layerId: layer.id, shape, matrix,
+    start: point, pointer: point, middle, end: middle,
+    pointReferences: scenePointReferences(undefined, new Map([[layer.id, [2, 3, 4]]])),
+    disableSnap: event.ctrlKey || event.metaKey,
   };
-  drawing.setPointerCapture(pointerId);
+  drawing.setPointerCapture(event.pointerId);
+}
+
+function startGuideBend(index, point, event) {
+  const guide = guides[index];
+  selectGuideOnCanvas(guide);
+  gesture = {
+    type: "guide-bend", id: event.pointerId, index, matrix: identityMatrix,
+    start: point, pointer: point, middle: guide.middle, end: guide.middle,
+    pointReferences: scenePointReferences(new Map([[index, [2, 3, 4]]])),
+    disableSnap: event.ctrlKey || event.metaKey,
+  };
+  drawing.setPointerCapture(event.pointerId);
 }
 
 function beginBezierControl(handle, event, point) {
@@ -1563,14 +1798,18 @@ function beginBezierControl(handle, event, point) {
   const shape = layer?.shape;
   const curve = shape ? inkCurveGeometry(baseInk(shape)) : guides[guideIndex];
   if (!curve) return;
-  if (guideIndex !== undefined) activeGuide = curve;
+  if (guideIndex !== undefined) selectGuideOnCanvas(curve);
   const matrix = shape?.kind === "affine" ? shape.matrix : identityMatrix;
   const original = bezierHandles(curve)[index];
   const anchor = index === 0 ? curve.start : curve.end;
+  const guideEdits = guideIndex === undefined ? undefined : new Map([[guideIndex, [index + 2]]]);
+  const inkEdits = layerId === undefined ? undefined : new Map([[layerId, [index + 2]]]);
   gesture = {
     type: "curve-control", id: event.pointerId, layerId, guideIndex, index, shape, matrix,
     start: point, pointer: point, original, end: original,
     anchor: projectPoint(matrix, anchor), worldControl: projectPoint(matrix, original),
+    pointReferences: scenePointReferences(guideEdits, inkEdits),
+    disableSnap: event.ctrlKey || event.metaKey, shiftKey: event.shiftKey,
   };
   drawing.setPointerCapture(event.pointerId);
   renderControls();
@@ -1665,14 +1904,49 @@ function reportBucketError() {
 
 function paintAt(point) {
   if (paintGuideRegion(point)) return;
+  const hit = layers.some((layer) => !layer.hidden && contains(layer.shape, point, Boolean(layer.text)));
+  if (!hit) {
+    const barriers = paintBarrierLayers();
+    if (barriers.length) queueEnclosedPaint(point, barriers);
+    return;
+  }
   const strokes = inkBarrierLayers();
   if (strokes.length) queueInkPaint(point, strokes, true);
   else paintLayerAt(point, brush);
 }
 
+function paintBarrierLayers() {
+  return layers.filter((layer) => !layer.hidden && (layer.opacity ?? 100) > 0 &&
+    (!layer.noFill || layer.stroke?.enabled));
+}
+
+function queueEnclosedPaint(point, barriers) {
+  const color = brush;
+  const opacity = opacityBrush;
+  bucketQueue = bucketQueue.then(async () => {
+    const barrier = await inkBarrier(barriers, point);
+    if (!sameInkBarrier(barriers, paintBarrierLayers())) return;
+    const region = barrier && closedInkRegion(barrier.raster, barrier.box, point, barrier.owners);
+    if (region && region.ids.length) paintInkRegion(region, point, color, opacity);
+  }).catch(reportBucketError);
+}
+
 function paintLayerAt(point, color, queued = false) {
   const layer = layers.findLast((item) => !item.hidden && contains(item.shape, point, Boolean(item.text)));
   if (!layer) return;
+  const { box, matrix } = shapeFrame(layer.shape);
+  if (box.regions) {
+    const local = unprojectPoint(matrix, point);
+    const x = box.sourceX + (local.x - number(box.x)) * box.sourceW / box.w;
+    const y = box.sourceY + (local.y - number(box.y)) * box.sourceH / box.h;
+    const region = box.regions.findLast((piece) => pathContext.isPointInPath(regionHitPath(piece), x, y));
+    if (region && region.color !== color) {
+      const regions = box.regions.map((piece) => piece === region ? { ...piece, color } : piece);
+      const shape = replaceRootXor(layer.shape, { ...box, regions });
+      commit(layers.map((item) => item === layer ? { ...layer, shape, noFill: false } : item));
+    }
+    return;
+  }
   const xor = rootXor(layer.shape);
   if (xor) {
     const local = layer.shape.kind === "affine" ? unprojectPoint(layer.shape.matrix, point) : point;
@@ -1796,18 +2070,20 @@ async function paintXorComponent(layerId, source, membership, point, color) {
   if (!layer.noFill && !xor.paintOnly && baseColor === color && !xor.paints?.length) return;
 
   const face = xorFace(xor, membership);
-  const vector = renderVector([{ shape: face, color: "#ffffff" }], "bucket-component");
-  const region = await findPaintComponent(vector, bounds(face), point);
+  const region = vectorBucketComponent(face, point) ??
+    await findPaintComponent(renderVector([{ shape: face, color: "#ffffff" }], "bucket-component"), bounds(face), point);
   if (!region || !layers.includes(layer)) return;
 
   const paintOnly = layer.noFill || Boolean(xor.paintOnly);
   const previous = layer.noFill ? [] : (xor.paints ?? []);
   const key = membership.join(",");
-  const matched = previous.find((paint) => paint.clip === region.clip && paint.membership.join(",") === key);
+  const matched = previous.find((paint) => paint.membership.join(",") === key &&
+    ((paint.clip === region.clip && paint.outline === region.outline) ||
+      (paint.clip && pathContext.isPointInPath(new Path2D(paint.clip), point.x, point.y))));
   if (matched?.color === color || (!matched && !paintOnly && baseColor === color)) return;
 
   const paints = previous.filter((paint) => paint !== matched);
-  if (paintOnly || color !== baseColor) paints.push({ membership, color, clip: region.clip });
+  if (paintOnly || color !== baseColor) paints.push({ membership, color, ...region });
   const shape = replaceRootXor(layer.shape, { ...xor, paints, paintOnly });
   commit(layers.map((item) => item === layer ? { ...layer, shape, noFill: false } : item));
 }
@@ -1907,14 +2183,65 @@ function endpointKey({ x, y }) {
   return number(x) + "," + number(y);
 }
 
-function jointMembers(origin, strokes) {
+function scenePointReferences(guideEdits, inkEdits) {
+  const references = [];
+  const primary = primarySelectionId();
+  function add(points, curve, includeHandles, excluded, matrix = identityMatrix) {
+    const candidates = includeHandles
+      ? [...points, ...bezierHandles(curve), ...(curve.controls ? [] : [curve.middle])]
+      : points;
+    for (const [index, point] of candidates.entries()) {
+      if (!excluded?.includes(index)) references.push(projectPoint(matrix, point));
+    }
+  }
+  guides.forEach((guide, index) => {
+    if (guideIsHidden(guide)) return;
+    const edited = guideEdits?.get(index);
+    const curve = guide.kind === "curve" ? guide : null;
+    add([guideEndpoint(guide, "start"), guideEndpoint(guide, "end")], curve,
+      curve && (guide === activeGuide || edited), edited);
+  });
+  for (const layer of layers) {
+    if (!visibleInkCandidate(layer)) continue;
+    const ink = baseInk(layer.shape);
+    if (!ink?.points.length) continue;
+    const edited = inkEdits?.get(layer.id);
+    const curve = ink.curve ? inkCurveGeometry(ink) : null;
+    const matrix = layer.shape.kind === "affine" ? layer.shape.matrix : identityMatrix;
+    add([ink.points[0], ink.points.at(-1)], curve, curve && ((!layer.groupId && layer.id === primary) || edited), edited, matrix);
+  }
+  return references;
+}
+
+function jointMembers(origin, strokes, minimum = 2) {
   const key = endpointKey(origin);
   const members = new Map();
   for (const [id, endpoints] of strokes) {
     const ends = endpoints.flatMap((point, index) => endpointKey(point) === key ? [index] : []);
     if (ends.length) members.set(id, ends);
   }
-  return members.size > 1 ? members : null;
+  return members.size >= minimum ? members : null;
+}
+
+function editableInkStrokes() {
+  return layers.flatMap((layer) => {
+    if (layer.groupId || !visibleInkCandidate(layer)) return [];
+    const ends = inkEndpoints(layer.shape);
+    return ends ? [[layer.id, ends]] : [];
+  });
+}
+
+function editableGuideStrokes() {
+  return guides.flatMap((guide, index) => guideIsHidden(guide) ? []
+    : [[index, [guideEndpoint(guide, "start"), guideEndpoint(guide, "end")]]]);
+}
+
+function beginMixedJoint(event, start, point, layer) {
+  const inkMembers = jointMembers(point, editableInkStrokes(), 1);
+  const guideMembers = jointMembers(point, editableGuideStrokes(), 1);
+  if (!inkMembers || !guideMembers || inkMembers.size + guideMembers.size < 3) return false;
+  beginJointMove(event, start, point, { inkMembers, guideMembers, layer });
+  return true;
 }
 
 function movedJointPoint({ original, dx, dy }) {
@@ -1931,7 +2258,7 @@ function inkAtJoint(shape, indices, point) {
   const ink = baseInk(shape);
   const local = shape.kind === "affine" ? unprojectPoint(shape.matrix, point) : point;
   const next = { ...ink, points: jointPoints(ink.points, indices, local) };
-  if (ink.controls) next.controls = curveWithEndpoint(inkCurveGeometry(ink), indices, local).controls;
+  if (ink.curve) next.controls = bezierHandles(inkCurveGeometry(ink));
   return replaceInk(shape, next);
 }
 
@@ -1952,7 +2279,8 @@ function beginJointMove(event, start, original, { guideMembers, inkMembers, laye
     for (const [index, ends] of guideMembers) {
       addOppositeRows([guideEndpoint(guides[index], "start"), guideEndpoint(guides[index], "end")], ends);
     }
-  } else {
+  }
+  if (inkMembers) {
     for (const layer of layers) {
       const ends = inkMembers.get(layer.id);
       if (ends) addOppositeRows(inkEndpoints(layer.shape), ends);
@@ -1962,6 +2290,7 @@ function beginJointMove(event, start, original, { guideMembers, inkMembers, laye
     type: "joint-move", id: event.pointerId, start, original, guideMembers, inkMembers,
     pointCenter: original, pointRows: horizontalPointReferences(references), oppositeRows, moveEnds: [original],
     snapTargets: references.flat(), extendPointRows: true,
+    centerLayout: { center: original, references: scenePointReferences(guideMembers, inkMembers) },
     dx: 0, dy: 0, rawDx: 0, rawDy: 0, lockAxis: event.shiftKey, disableSnap: event.ctrlKey || event.metaKey,
   };
   trackResizeTap(event, layer);
@@ -2056,6 +2385,9 @@ function beginLineResize(event, start, ends, endIndex, { guideIndex, layer }) {
   gesture = {
     type: "line-resize", id: event.pointerId, start, end: start, ends, endIndex, anchor, original,
     point: original, references, snapTargets, guideIndex, layerId: layer?.id, shape: layer?.shape,
+    pointReferences: scenePointReferences(
+      guideIndex === undefined ? undefined : new Map([[guideIndex, [endIndex]]]),
+      layer ? new Map([[layer.id, [endIndex]]]) : undefined),
     disableSnap: event.ctrlKey || event.metaKey, shiftKey: event.shiftKey,
   };
   trackResizeTap(event, layer);
@@ -2071,6 +2403,7 @@ function updateLineResize() {
   const dy = end.y - start.y;
   gesture.endpointSnap = null;
   gesture.lengthHint = null;
+  gesture.centerHint = null;
   if (Math.hypot(dx, dy) <= guideEpsilon) {
     gesture.point = original;
     return;
@@ -2085,7 +2418,10 @@ function updateLineResize() {
   const limit = guideSnapDistance();
   const endpoint = disableSnap ? null : nearestLineEnd(point, snapTargets, limit, ray);
   const match = disableSnap || endpoint ? null : snapLineLength(anchor, point, references, limit);
-  gesture.point = endpoint ?? match?.point ?? point;
+  const aligned = endpoint || match ? point : alignEditedPoint(gesture, point, ray && { x: ray.dx, y: ray.dy });
+  const alignedLength = Math.hypot(aligned.x - anchor.x, aligned.y - anchor.y);
+  if (alignedLength < 2) gesture.centerHint = null;
+  gesture.point = endpoint ?? match?.point ?? (alignedLength >= 2 ? aligned : point);
   gesture.endpointSnap = endpoint;
   if (match) gesture.lengthHint = [resizedLineEnds(gesture), match.reference];
 }
@@ -2192,7 +2528,31 @@ function snapShapeCenters(layout, dx, dy, direction, tolerance) {
   return x || y ? { dx: point.x - center.x, dy: point.y - center.y, hint: { point, x, y } } : null;
 }
 
+function alignEditedPoint(edit, point, direction = null) {
+  const aligned = !edit.disableSnap && edit.pointReferences?.length
+    ? snapShapeCenters({ center: point, references: edit.pointReferences }, 0, 0, direction,
+      Math.min(14, 6 * svgUnitsPerPixel()))
+    : null;
+  edit.centerHint = aligned?.hint;
+  return aligned?.hint.point ?? point;
+}
+
+function updateMidpoint(edit) {
+  const dx = edit.pointer.x - edit.start.x;
+  const dy = edit.pointer.y - edit.start.y;
+  if (Math.hypot(dx, dy) <= guideEpsilon) {
+    edit.centerHint = null;
+    edit.end = edit.middle;
+    return;
+  }
+  const { matrix } = edit;
+  const origin = projectPoint(matrix, edit.middle);
+  const point = pointOnCanvas({ x: origin.x + dx, y: origin.y + dy });
+  edit.end = unprojectPoint(matrix, alignEditedPoint(edit, point));
+}
+
 function updateBezierDirection(edit, locked) {
+  edit.shiftKey = locked;
   const x = edit.pointer.x - edit.start.x;
   const y = edit.pointer.y - edit.start.y;
   if (edit.type === "curve-anchor") {
@@ -2204,11 +2564,13 @@ function updateBezierDirection(edit, locked) {
   } else {
     if (Math.hypot(x, y) <= guideEpsilon) {
       edit.end = edit.original;
+      edit.centerHint = null;
       return;
     }
     const { anchor, worldControl } = edit;
-    const { dx, dy } = movementDirection(worldControl.x + x - anchor.x, worldControl.y + y - anchor.y, locked);
-    edit.end = unprojectPoint(edit.matrix, { x: anchor.x + dx, y: anchor.y + dy });
+    const { dx, dy, direction } = movementDirection(worldControl.x + x - anchor.x, worldControl.y + y - anchor.y, locked);
+    const point = alignEditedPoint(edit, { x: anchor.x + dx, y: anchor.y + dy }, direction);
+    edit.end = unprojectPoint(edit.matrix, point);
   }
 }
 
@@ -2217,8 +2579,15 @@ function updateSnapMove() {
   const { dx, dy, direction } = movementDirection(rawDx, rawDy, lockAxis);
   const moved = Math.hypot(rawDx, rawDy) > 1;
   const snap = moved && !disableSnap;
-  const endpoint = snap && moveEnds?.length
+  let endpoint = snap && moveEnds?.length
     ? snapLineMove(moveEnds, gesture.snapTargets, dx, dy, direction, guideSnapDistance()) : null;
+  if (snap && !endpoint && gesture.type === "move") {
+    gesture.vertexEnds ??= layers.filter((layer) => !layer.hidden && gesture.targets.has(layer.id))
+      .flatMap((layer) => worldVertexPoints(layer));
+    if (gesture.vertexEnds.length) {
+      endpoint = snapVertexMove(gesture, [...(moveEnds ?? []), ...gesture.vertexEnds], gesture.targets, dx, dy, direction);
+    }
+  }
   const tolerance = Math.min(14, 6 * svgUnitsPerPixel());
   const spacing = snap && !endpoint
     ? pointRows
@@ -2229,9 +2598,11 @@ function updateSnapMove() {
   const alignment = snap && !endpoint
     ? snapLineAlignment(lineLayout, spacing?.dx ?? dx, spacing?.dy ?? dy, direction, spacing && direction ? 0 : tolerance)
     : null;
-  const center = snap && !endpoint && !alignment && !spacing
-    ? snapShapeCenters(gesture.centerLayout, dx, dy, direction, tolerance) : null;
-  const snapped = endpoint ?? alignment ?? spacing ?? center;
+  const jointX = gesture.type === "joint-move" && spacing && !direction;
+  const center = snap && !endpoint && !alignment && (!spacing || jointX)
+    ? snapShapeCenters(gesture.centerLayout, spacing?.dx ?? dx, spacing?.dy ?? dy,
+      jointX ? { x: 1, y: 0 } : direction, tolerance) : null;
+  const snapped = endpoint ?? alignment ?? center ?? spacing;
   gesture.dx = snapped?.dx ?? dx;
   gesture.dy = snapped?.dy ?? dy;
   gesture.spacingHint = spacing?.hint;
@@ -2319,9 +2690,101 @@ function inkSnapLine(shape) {
   return path;
 }
 
+function branchableInk(shape) {
+  if (inkBranchCache.has(shape)) return inkBranchCache.get(shape);
+  const ink = inkInWorld(shape);
+  const pieces = [];
+  if (ink?.curve) {
+    pieces.push({ kind: "curve", ...inkCurveGeometry(ink) });
+  } else if (ink?.points.length > 1) {
+    const { points } = ink;
+    let start = points[0];
+    for (let i = 1; i < points.length - 1; i++) {
+      const control = points[i];
+      const end = midpoint(control, points[i + 1]);
+      const middle = midpoint(midpoint(start, control), midpoint(control, end));
+      pieces.push({ kind: "curve", start, middle, end });
+      start = end;
+    }
+    pieces.push([start, points.at(-1)]);
+  }
+  inkBranchCache.set(shape, pieces);
+  return pieces;
+}
+
+function closestBranch(point) {
+  let best = null;
+  let distance = Infinity;
+  const limit = guideSnapDistance();
+  const pointDistance = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+  function consider(strokes, source, layer) {
+    if (!strokes.length) return;
+    const start = guideEndpoint(strokes[0], "start");
+    const end = guideEndpoint(strokes.at(-1), "end");
+    if (pointDistance(start, point) <= limit || pointDistance(end, point) <= limit) return;
+    const reach = limit + (layer ? baseInk(layer.shape).width / 2 : 0);
+    for (const [index, stroke] of strokes.entries()) {
+      const location = guideBranchLocation(stroke, point, Math.min(reach, distance));
+      if (!location || location.distance > reach || location.distance >= distance) continue;
+      distance = location.distance;
+      best = {
+        source, layerId: layer?.id, point: location.point,
+        pieces: [...strokes.slice(0, index), ...location.pieces, ...strokes.slice(index + 1)],
+      };
+    }
+    // Older pencil strokes can have several Bézier segments before a split.
+    for (let index = 1; index < strokes.length; index++) {
+      const joint = guideEndpoint(strokes[index], "start");
+      const gap = pointDistance(joint, point);
+      if (gap > reach || gap >= distance) continue;
+      distance = gap;
+      best = { source, layerId: layer?.id, point: joint, pieces: strokes };
+    }
+  }
+  for (let i = layers.length - 1; i >= 0; i--) {
+    const layer = layers[i];
+    if (visibleInkCandidate(layer)) consider(branchableInk(layer.shape), layer.shape, layer);
+  }
+  for (const guide of guides) {
+    if (!guideIsHidden(guide)) consider([guide], guide);
+  }
+  return best;
+}
+
+function splitBranchParent(branch) {
+  const scene = { layers, guides };
+  if (!branch) return scene;
+  const { source, pieces, layerId } = branch;
+  if (layerId === undefined) {
+    const index = guides.indexOf(source);
+    if (index >= 0) {
+      replaceGuideRow(source, pieces[0]);
+      scene.guides = [...guides.slice(0, index), ...pieces, ...guides.slice(index + 1)];
+    }
+    return scene;
+  }
+  const parent = layers.find((layer) => layer.id === layerId && layer.shape === source);
+  if (!parent) return scene;
+  const ink = baseInk(source);
+  const chainId = parent.inkChain ?? parent.id;
+  const parts = pieces.map((piece, index) => ({
+    ...parent, id: index === 0 ? parent.id : nextId++, inkChain: chainId,
+    shape: Array.isArray(piece)
+      ? { kind: "ink", points: piece, curve: false, width: ink.width }
+      : { kind: "ink", points: [piece.start, piece.middle, piece.end], curve: true, width: ink.width,
+        ...(piece.controls ? { controls: piece.controls } : {}) },
+  }));
+  scene.layers = layers.flatMap((layer) => layer === parent ? parts
+    : layer.inkBoundary?.includes(parent.id)
+      ? [{ ...layer, inkBoundary: [...layer.inkBoundary, ...parts.slice(1).map(({ id }) => id)].sort((a, b) => a - b) }]
+      : [layer]);
+  scene.groupId = parent.groupId;
+  return scene;
+}
+
 function snappedDrawingStart(raw, anchor) {
   if (anchor) return anchor;
-  const lines = [...guides];
+  const lines = guides.filter((guide) => !guideIsHidden(guide));
   for (const layer of layers) {
     if (!visibleInkCandidate(layer)) continue;
     const line = inkSnapLine(layer.shape);
@@ -2347,12 +2810,16 @@ function startLineStroke(event, start, inkEndpoint) {
   const controlKey = event.ctrlKey || event.metaKey;
   const references = sceneStraightLines();
   const snapTargets = references.flat();
-  const snappedStart = snappedDrawingStart(raw, inkEndpoint?.point ?? clickedGuideEndpoint(event));
+  const anchor = inkEndpoint?.point ?? clickedGuideEndpoint(event);
+  const branch = anchor ? null : closestBranch(raw);
+  const snappedStart = branch?.point ?? snappedDrawingStart(raw, anchor);
   const point = controlKey ? raw : snappedStart;
   gesture = {
     type: tool, id: event.pointerId, start: point, end: point, snapTargets, references,
-    pointerStart: raw, snappedStart, shiftKey: event.shiftKey, controlKey,
+    pointerStart: raw, snappedStart, shiftKey: event.shiftKey, controlKey, branch,
   };
+  branchHover = null;
+  branchCursor = null;
   if (tool === "ink") {
     gesture.width = inkWidth;
     gesture.anchorLayerId = inkEndpoint?.layer.id;
@@ -2372,13 +2839,20 @@ function finishStraightStroke(stroke) {
   const points = lineStrokePoints(stroke, stroke.type === "guide");
   if (points.length !== 2) return false;
   pendingStraight = null;
-  if (stroke.type === "ink") commitInk({ kind: "ink", points, width: stroke.width, curve: false });
-  else commit(layers, selection, [...guides, points]);
+  const branch = stroke.start === stroke.branch?.point ? stroke.branch : null;
+  if (stroke.type === "ink") commitInk({ kind: "ink", points, width: stroke.width, curve: false }, branch);
+  else {
+    const scene = splitBranchParent(branch);
+    activeGuide = points;
+    commit(scene.layers, selection, [...scene.guides, points]);
+  }
   return true;
 }
 
 function clearLinePlacement() {
   pendingStraight = null;
+  branchHover = null;
+  branchCursor = null;
   clearCurvePlacement();
 }
 
@@ -2415,17 +2889,20 @@ function clearCurvePlacement() {
   curvePoints = [];
   curveCursor = null;
   curveStartControl = null;
+  curveBranch = null;
 }
 
 function finishCurve(curve) {
   const { start, middle, end, controls } = curve;
+  const branch = curveBranch;
   clearCurvePlacement();
   if (![middle, end, ...(controls ?? [])].some((point) => Math.hypot(point.x - start.x, point.y - start.y) >= 2)) return false;
   if (tool === "ink-curve") {
-    commitInk({ kind: "ink", points: [start, middle, end], ...(controls ? { controls } : {}), width: inkWidth, curve: true });
+    commitInk({ kind: "ink", points: [start, middle, end], ...(controls ? { controls } : {}), width: inkWidth, curve: true }, branch);
   } else {
+    const scene = splitBranchParent(branch);
     activeGuide = { kind: "curve", ...curve };
-    commit(layers, selection, [...guides, activeGuide]);
+    commit(scene.layers, selection, [...scene.guides, activeGuide]);
   }
   return true;
 }
@@ -2445,8 +2922,12 @@ function placeCurveAnchor(event, point, anchor) {
     return;
   }
   const raw = pointOnCanvas(point);
-  const position = event.ctrlKey || event.metaKey ? raw : snappedDrawingStart(raw, anchor);
+  const disableSnap = event.ctrlKey || event.metaKey;
+  if (!ending) curveBranch = disableSnap || anchor ? null : closestBranch(raw);
+  const position = disableSnap ? raw : (!ending && curveBranch?.point) || snappedDrawingStart(raw, anchor);
   if (!ending) curvePoints = [position];
+  branchHover = null;
+  branchCursor = null;
   curveCursor = position;
   gesture = {
     type: "curve-anchor", id: event.pointerId, start: raw, position, ending, control: position,
@@ -2458,7 +2939,7 @@ function placeCurveAnchor(event, point, anchor) {
 }
 
 function resizeSelectedLayer() {
-  if (!selection.size || layerDrag.active) return;
+  if (!selection.size || layerDrag.active || textPointEdit) return;
   const layer = primaryGeometryLayer();
   if (layer?.id !== resizeId) showResizeHandles(layer);
 }
@@ -2568,6 +3049,14 @@ function groupResizeMatrix({ group, preview, frame }) {
   return preview.kind === "affine" ? preview.matrix : scalingMatrix(frame.box, preview);
 }
 
+function startMarquee(event, start, type = "marquee") {
+  gesture = {
+    type, id: event.pointerId, start, end: start, dragged: false, additive: event.shiftKey,
+    startClientX: event.clientX, startClientY: event.clientY,
+  };
+  drawing.setPointerCapture(event.pointerId);
+}
+
 drawing.addEventListener("pointerdown", (event) => {
   const rightButton = event.button === 2;
   if (rightButton && cancelLinePlacement()) {
@@ -2575,7 +3064,29 @@ drawing.addEventListener("pointerdown", (event) => {
     return;
   }
   if (gesture || (event.button !== 0 && !rightButton)) return;
+  if (rightButton && branchHover) {
+    branchHover = null;
+    branchCursor = null;
+    renderDrawing();
+  }
   const start = pointAt(event.clientX, event.clientY);
+  if (textPointEdit) {
+    const handle = event.target.closest("[data-text-point], [data-text-control]");
+    const layer = editableTextPointLayer();
+    if (!rightButton) {
+      if (handle && layer) {
+        startTextPointDrag(handle, event, start, layer);
+        return;
+      }
+      const hit = layerAt(start);
+      if ((!hit || hit === layer) && layer && textPointFrame(layer.shape, layer.color)) {
+        startMarquee(event, start, "text-point-marquee");
+        return;
+      }
+      if (hit && hit !== layer) selectLayer(hit.id, false, true);
+      return;
+    }
+  }
   const inkEndpoint = clickedInkEndpoint(event);
   if (!rightButton && isInkTool() && event.altKey) {
     event.preventDefault();
@@ -2591,6 +3102,21 @@ drawing.addEventListener("pointerdown", (event) => {
     placeCurveAnchor(event, start, inkEndpoint?.point ?? clickedGuideEndpoint(event));
     return;
   }
+  const bezierHandle = event.target.closest("[data-bezier-control]");
+  if (bezierHandle) {
+    beginBezierControl(bezierHandle, event, start);
+    return;
+  }
+  if (event.target.closest("[data-ink-midpoint]")) {
+    const layer = layers.find((item) => item.id === primarySelectionId() && !item.hidden);
+    if (!layer?.groupId && baseInk(layer?.shape)?.curve) startInkBend(layer, start, event);
+    return;
+  }
+  const guideMidpointHandle = event.target.closest("[data-curve-index]");
+  if (guideMidpointHandle) {
+    startGuideBend(Number(guideMidpointHandle.dataset.curveIndex), start, event);
+    return;
+  }
   const selectedHit = rightButton && selection.size > 1
     ? inkEndpoint?.layer ?? layerAt(start) : null;
   if (rightButton) {
@@ -2598,13 +3124,14 @@ drawing.addEventListener("pointerdown", (event) => {
     const index = inkEndpoint || (!guideHandle && selection.has(selectedHit?.id)) ? -1
       : guideHandle ? Number(guideHandle.dataset.guideIndex) : guideNear(start, guides, guideSnapDistance());
     if (index >= 0) {
-      activeGuide = guides[index];
+      selectGuideOnCanvas(guides[index]);
       const ends = lineEnds(activeGuide);
-      const strokes = guides.map((guide, i) => [i, [guideEndpoint(guide, "start"), guideEndpoint(guide, "end")]]);
-      const endpoints = strokes[index][1];
+      const strokes = editableGuideStrokes();
+      const endpoints = [guideEndpoint(activeGuide, "start"), guideEndpoint(activeGuide, "end")];
       const endIndex = guideHandle ? Number(guideHandle.dataset.guideEnd === "end") : lineEndAt(endpoints, start);
       if (endIndex >= 0) {
         const point = endpoints[endIndex];
+        if (beginMixedJoint(event, start, point)) return;
         const guideMembers = jointMembers(point, strokes);
         if (guideMembers) {
           beginJointMove(event, start, point, { guideMembers });
@@ -2631,16 +3158,6 @@ drawing.addEventListener("pointerdown", (event) => {
       renderControls();
       return;
     }
-  }
-  const bezierHandle = event.target.closest("[data-bezier-control]");
-  if (!rightButton && bezierHandle) {
-    beginBezierControl(bezierHandle, event, start);
-    return;
-  }
-  if (!rightButton && event.target.closest("[data-ink-midpoint]")) {
-    const layer = layers.find((item) => item.id === primarySelectionId() && !item.hidden);
-    if (!layer?.groupId && baseInk(layer?.shape)?.curve) startInkBend(layer, start, event.pointerId);
-    return;
   }
   if (!rightButton && event.target.closest("[data-rotate]")) {
     const layer = primaryGeometryLayer();
@@ -2670,28 +3187,13 @@ drawing.addEventListener("pointerdown", (event) => {
     return;
   }
   if (!rightButton && tool === "curve") {
-    const endpoint = clickedGuideEndpoint(event);
-    const handle = event.target.closest("[data-curve-index]");
-    if (endpoint) {
-      placeCurveAnchor(event, start, endpoint);
-    } else if (handle && !curvePoints.length) {
-      const index = Number(handle.dataset.curveIndex);
-      const { middle } = guides[index];
-      gesture = { type: "guide-bend", id: event.pointerId, index, start, middle, end: middle };
-      drawing.setPointerCapture(event.pointerId);
-    } else {
-      placeCurveAnchor(event, start);
-    }
+    placeCurveAnchor(event, start, clickedGuideEndpoint(event));
     return;
   }
   if (rightButton || tool === "select") {
     const hit = inkEndpoint?.layer ?? selectedHit ?? layerAt(start);
     if (!rightButton && !hit) {
-      gesture = {
-        type: "marquee", id: event.pointerId, start, end: start, dragged: false,
-        startClientX: event.clientX, startClientY: event.clientY,
-      };
-      drawing.setPointerCapture(event.pointerId);
+      startMarquee(event, start);
       return;
     }
     const fullySelected = hit?.groupId
@@ -2708,12 +3210,8 @@ drawing.addEventListener("pointerdown", (event) => {
     const endIndex = endpoints ? inkEndpoint?.index ?? lineEndAt(endpoints, start) : -1;
     if (endIndex >= 0) {
       const point = endpoints[endIndex];
-      const strokes = layers.flatMap((layer) => {
-        if (layer.groupId || !visibleInkCandidate(layer)) return [];
-        const strokeEnds = inkEndpoints(layer.shape);
-        return strokeEnds ? [[layer.id, strokeEnds]] : [];
-      });
-      const inkMembers = jointMembers(point, strokes);
+      if (beginMixedJoint(event, start, point, hit)) return;
+      const inkMembers = jointMembers(point, editableInkStrokes());
       if (inkMembers) {
         beginJointMove(event, start, point, { inkMembers, layer: hit });
         return;
@@ -2780,8 +3278,13 @@ function updateGesture(event) {
   const end = pointAt(event.clientX, event.clientY);
   const tap = gesture.resizeTap;
   if (tap) tap.dragged ||= Math.hypot(event.clientX - tap.x, event.clientY - tap.y) > 3;
-  if (gesture.type === "draw" || gesture.type === "marquee") {
-    gesture.end = gesture.type === "marquee" ? pointOnCanvas(end) : end;
+  if (gesture.type === "text-point") {
+    gesture.pointer = end;
+    gesture.shiftKey = event.shiftKey;
+    gesture.disableSnap = event.ctrlKey || event.metaKey;
+  } else if (gesture.type === "draw" || gesture.type === "marquee" || gesture.type === "text-point-marquee") {
+    gesture.end = gesture.type === "draw" ? end : pointOnCanvas(end);
+    if (gesture.type === "text-point-marquee") gesture.additive = event.shiftKey;
     gesture.dragged ||= Math.hypot(event.clientX - gesture.startClientX, event.clientY - gesture.startClientY) > 3;
     if (gesture.type === "draw" && gesture.dragged) gesture.shape = drawnShape(gesture.start, end, event.shiftKey);
   } else if (gesture.type === "resize") {
@@ -2800,14 +3303,12 @@ function updateGesture(event) {
       gesture.dragged ||= Math.hypot(event.clientX - gesture.startClientX, event.clientY - gesture.startClientY) > 3;
     }
     gesture.pointer = end;
+    gesture.disableSnap = event.ctrlKey || event.metaKey;
     updateBezierDirection(gesture, event.shiftKey);
-  } else if (gesture.type === "ink-bend") {
-    const { start, middle, matrix } = gesture;
-    const local = unprojectPoint(matrix, pointOnCanvas(end));
-    gesture.end = { x: middle.x + local.x - start.x, y: middle.y + local.y - start.y };
-  } else if (gesture.type === "guide-bend") {
-    const { start, middle } = gesture;
-    gesture.end = pointOnCanvas({ x: middle.x + end.x - start.x, y: middle.y + end.y - start.y });
+  } else if (gesture.type === "ink-bend" || gesture.type === "guide-bend") {
+    gesture.pointer = end;
+    gesture.disableSnap = event.ctrlKey || event.metaKey;
+    updateMidpoint(gesture);
   } else if (gesture.type === "line-resize") {
     gesture.end = end;
     gesture.disableSnap = event.ctrlKey || event.metaKey;
@@ -2830,9 +3331,24 @@ drawing.addEventListener("pointermove", (event) => {
     if (!drawingFrame) drawingFrame = requestAnimationFrame(renderDrawing);
     return;
   }
+  if (!gesture && (isStraightTool(tool) || isCurveTool(tool))) {
+    branchCursor = event.target.closest("[data-bezier-control], [data-ink-end], [data-guide-end], [data-curve-index], [data-ink-midpoint]")
+      ? null : pointAt(event.clientX, event.clientY);
+    const previous = branchHover;
+    branchHover = branchCursor && !event.ctrlKey && !event.metaKey ? closestBranch(branchCursor) : null;
+    if ((previous || branchHover) && !drawingFrame) drawingFrame = requestAnimationFrame(renderDrawing);
+    return;
+  }
   if (gesture?.id !== event.pointerId) return;
   updateGesture(event);
   if (!drawingFrame) drawingFrame = requestAnimationFrame(renderDrawing);
+});
+
+drawing.addEventListener("pointerleave", () => {
+  branchCursor = null;
+  if (!branchHover) return;
+  branchHover = null;
+  renderDrawing();
 });
 
 drawing.addEventListener("pointerup", (event) => {
@@ -2844,6 +3360,19 @@ drawing.addEventListener("pointerup", (event) => {
   delete drawing.dataset.moving;
   delete drawing.dataset.resizing;
   delete drawing.dataset.rotating;
+  if (finished.type === "text-point") {
+    const shape = movedTextOutline(finished);
+    if (shape !== finished.shape) {
+      commit(layers.map((layer) => layer.id === finished.layerId ? { ...layer, shape, inkChain: undefined } : layer));
+    } else {
+      renderDrawing();
+    }
+    return;
+  }
+  if (finished.type === "text-point-marquee") {
+    finishTextPointMarquee(finished);
+    return;
+  }
   if (finishResizeTap(finished)) return;
   if (finished.type === "marquee") {
     finishMarquee(finished, event.shiftKey);
@@ -2851,19 +3380,16 @@ drawing.addEventListener("pointerup", (event) => {
   }
   if (finished.type === "joint-move" && Math.hypot(finished.dx, finished.dy) > 1) {
     const point = movedJointPoint(finished);
-    if (finished.guideMembers) {
-      const nextGuides = guides.map((guide, index) => {
-        const ends = finished.guideMembers.get(index);
-        return ends ? guideAtJoint(guide, ends, point) : guide;
-      });
-      activeGuide = nextGuides[guides.indexOf(activeGuide)];
-      commit(layers, selection, nextGuides);
-    } else {
-      commit(layers.map((layer) => {
-        const ends = finished.inkMembers.get(layer.id);
-        return ends ? { ...layer, shape: inkAtJoint(layer.shape, ends, point) } : layer;
-      }));
-    }
+    const nextGuides = finished.guideMembers ? guides.map((guide, index) => {
+      const ends = finished.guideMembers.get(index);
+      return ends ? replaceGuideRow(guide, guideAtJoint(guide, ends, point)) : guide;
+    }) : guides;
+    const nextLayers = finished.inkMembers ? layers.map((layer) => {
+      const ends = finished.inkMembers.get(layer.id);
+      return ends ? { ...layer, shape: inkAtJoint(layer.shape, ends, point) } : layer;
+    }) : layers;
+    if (activeGuide) activeGuide = nextGuides[guides.indexOf(activeGuide)];
+    commit(nextLayers, selection, nextGuides);
     return;
   }
   if (finished.type === "line-resize") {
@@ -2872,7 +3398,7 @@ drawing.addEventListener("pointerup", (event) => {
       renderDrawing();
       renderControls();
     } else if (guideIndex !== undefined) {
-      const resized = resizedLineEnds(finished);
+      const resized = replaceGuideRow(guides[guideIndex], resizedLineEnds(finished));
       activeGuide = resized;
       commit(layers, selection, guides.map((guide, index) => index === guideIndex ? resized : guide));
     } else {
@@ -2892,7 +3418,7 @@ drawing.addEventListener("pointerup", (event) => {
       const { guideIndex } = finished;
       const guide = withBezierControl(guides[guideIndex], finished);
       if (guide !== guides[guideIndex]) {
-        activeGuide = guide;
+        activeGuide = replaceGuideRow(guides[guideIndex], guide);
         commit(layers, selection, guides.map((item, index) => index === guideIndex ? guide : item));
         return;
       }
@@ -2940,7 +3466,8 @@ drawing.addEventListener("pointerup", (event) => {
   if (finished.type === "guide-bend") {
     const { middle, end, index } = finished;
     if (Math.hypot(middle.x - end.x, middle.y - end.y) > guideEpsilon) {
-      commit(layers, selection, guides.map((guide, i) => i === index ? { ...guide, middle: end } : guide));
+      activeGuide = replaceGuideRow(guides[index], { ...guides[index], middle: end });
+      commit(layers, selection, guides.map((guide, i) => i === index ? activeGuide : guide));
     } else {
       renderDrawing();
     }
@@ -2949,7 +3476,7 @@ drawing.addEventListener("pointerup", (event) => {
   if (finished.type === "guide-move") {
     const { index, indices, dx, dy } = finished;
     if (Math.hypot(dx, dy) > 1) {
-      const moved = guides.map((guide, i) => indices.has(i) ? moveGuide(guide, dx, dy) : guide);
+      const moved = guides.map((guide, i) => indices.has(i) ? replaceGuideRow(guide, moveGuide(guide, dx, dy)) : guide);
       activeGuide = moved[index];
       commit(layers, selection, moved);
     } else {
@@ -3076,7 +3603,18 @@ function combine(kind) {
 }
 
 function removeSelection() {
-  removeLayers(selection);
+  if (selection.size) removeLayers(selection);
+  else if (activeGuide) removeGuide(activeGuide);
+}
+
+function selectGuideOnCanvas(guide) {
+  if (activeGuide === guide) return;
+  activeGuide = guide;
+  renderLayers();
+}
+
+function removeGuide(guide) {
+  commit(layers, selection, guides.filter((item) => item !== guide));
 }
 
 function copySelection() {
@@ -3105,12 +3643,15 @@ function pasteSelection() {
   } else {
     const idMap = new Map(copiedObjects.layers.map((layer) => [layer.id, nextId++]));
     const groups = new Map();
+    const chains = new Map();
     const pasted = copiedObjects.layers.map((layer) => {
       if (layer.groupId && !groups.has(layer.groupId)) groups.set(layer.groupId, nextId++);
+      if (layer.inkChain && !chains.has(layer.inkChain)) chains.set(layer.inkChain, nextId++);
       const inkBoundary = layer.inkBoundary?.every((id) => idMap.has(id))
         ? layer.inkBoundary.map((id) => idMap.get(id)).sort((a, b) => a - b) : undefined;
       return {
         ...layer, id: idMap.get(layer.id), groupId: groups.get(layer.groupId), inkBoundary,
+        inkChain: chains.get(layer.inkChain),
         shape: move(layer.shape, offset, offset),
       };
     });
@@ -3169,7 +3710,10 @@ function reorderLayer(direction) {
 }
 
 function selectedLayerOrder() {
-  if (!selection.size) return null;
+  if (!selection.size) {
+    const index = guides.indexOf(activeGuide);
+    return index < 0 ? null : { id: guideRowId(activeGuide), index, size: guides.length };
+  }
   const blocks = layerBlocks();
   const index = blocks.findIndex((block) => block.members.some((layer) => selection.has(layer.id)));
   if (index < 0) return null;
@@ -3179,6 +3723,18 @@ function selectedLayerOrder() {
 }
 
 function moveLayer(id, to, before) {
+  if (id < 0) {
+    const from = guideRowIndex(id);
+    if (from < 0 || to < 0 || to >= guides.length || from === to) return;
+    before ??= layerPositions(layerList);
+    const ordered = [...guides];
+    const [guide] = ordered.splice(from, 1);
+    ordered.splice(to, 0, guide);
+    commit(layers, selection, ordered);
+    animateLayerOrder(layerList, before);
+    byId("layer-order-status").textContent = "点線を上から " + (ordered.length - to) + " 番目に移動";
+    return;
+  }
   const blocks = layerBlocks();
   const from = blocks.findIndex((block) => block.id === id);
   if (from < 0 || to < 0 || to >= blocks.length || from === to) return;
@@ -3197,7 +3753,7 @@ function applyColor(color) {
   if (tool !== "bucket" && layers.some((layer) =>
     selection.has(layer.id) && (layer.color !== color || hasXorColors(rootXor(layer.shape))),
   )) {
-    commit(layers.map((layer) => selection.has(layer.id) ? { ...layer, color, shape: clearXorColors(layer.shape) } : layer));
+    commit(layers.map((layer) => selection.has(layer.id) ? { ...layer, color, shape: clearXorColors(layer.shape, color) } : layer));
   } else {
     render();
   }
@@ -3266,30 +3822,360 @@ const textFont = byId("text-font");
 const textSubmit = byId("text-submit");
 const textPreview = byId("text-preview");
 const textMessage = byId("text-message");
-const fontOptions = byId("font-options");
-const fontMarks = [
-  '<path d="M5 6h14M6 12h12M8 18h8"/>',
-  '<path d="M4 8c5-5 10 4 16-1M5 14c3-4 10 4 15 0m-13 5 10-1"/>',
-  '<path d="M4 6h16M4 12h12M4 18h14"/>',
-  '<path d="M4 7h16m-16 5h16m-16 5h12" stroke-width="3.5"/>',
-  '<path d="M5 5v3m14-3v3M5 6h14M12 6v12m-4 0h8"/>',
-  '<path d="M3 17c5 2 6-10 10-10 3 0 2 6-2 8-4 2 4 4 10-2"/>',
-];
+const fontImportButton = byId("font-import");
+const fontFile = byId("font-file");
 
-textFont.replaceChildren(...textFonts.map(({ id, name, description }) =>
-  new Option(name + "（" + description + "）", id),
-));
-fontOptions.innerHTML = textFonts.map(({ id, name, description }, index) => {
-  const label = escapeMarkup(name + "（" + description + "）");
-  return '<button type="button" class="icon-button" data-font-id="' + id + '" aria-pressed="false" aria-label="' + label +
-    '"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" ' +
-    'stroke-width="1.7" aria-hidden="true">' + fontMarks[index] + '</svg></button>';
-}).join("");
-fontOptions.addEventListener("click", (event) => {
-  const button = event.target.closest("[data-font-id]");
-  if (!button) return;
-  textFont.value = button.dataset.fontId;
-  queueTextPreview();
+function renderTextFontOptions(selected = textFont.value, saved = textState?.saved) {
+  const localFonts = [...importedTextFonts.values()].sort((a, b) => a.name.localeCompare(b.name));
+  const fonts = [...textFonts, ...localFonts];
+  // A saved outline remains editable even when its original font file is unavailable.
+  if (saved && isImportedTextFontId(saved.fontId) && !importedTextFonts.has(saved.fontId)) {
+    fonts.push({ id: saved.fontId, name: saved.fontName ?? "読み込んだ書体" });
+  }
+  textFont.replaceChildren(...fonts.map(({ id, name }) => new Option(name, id)));
+  textFont.value = fonts.some(({ id }) => id === selected) ? selected : textFonts[0].id;
+}
+
+renderTextFontOptions();
+loadImportedFontCatalog().then(() => renderTextFontOptions());
+
+fontImportButton.addEventListener("click", () => fontFile.click());
+fontFile.addEventListener("change", async () => {
+  const file = fontFile.files[0];
+  if (!file || fontImportButton.disabled) return;
+  fontFile.value = "";
+  const state = textState;
+  fontImportButton.disabled = true;
+  fontImportButton.setAttribute("aria-busy", "true");
+  try {
+    const { id, saved } = await importOutlineFont(file);
+    const stillEditing = state && textState === state;
+    renderTextFontOptions(stillEditing ? id : textFont.value);
+    if (stillEditing) queueTextPreview();
+    showNotice(saved ? "書体を読み込みました" : "書体を読み込みました。ブラウザに保存できませんでした。");
+  } catch (error) {
+    showNotice("書体の読み込みに失敗しました。 " + error.message);
+  } finally {
+    fontImportButton.disabled = false;
+    fontImportButton.removeAttribute("aria-busy");
+  }
+});
+
+function editableTextPointLayer() {
+  if (tool !== "select" || selection.size !== 1) return null;
+  return layers.find((layer) => layer.id === primarySelectionId() && !layer.groupId && !layer.hidden);
+}
+
+function textPointModel(base) {
+  if (!textPointModels.has(base)) {
+    textPointModels.set(base, textOutlinePoints(base.pathData, base.regions, base.weldPoints, base.joinedVertices));
+  }
+  return textPointModels.get(base);
+}
+
+function textPointFrame(shape, color) {
+  const original = shape.kind === "affine" ? shape.base : shape;
+  const matrix = shape.kind === "affine" ? shape.matrix : identityMatrix;
+  const base = prepareVertexShape(original, color);
+  if (!base) return null;
+  const sx = base.w / base.sourceW;
+  const sy = base.h / base.sourceH;
+  const local = [sx, 0, 0, sy, number(base.x) - base.sourceX * sx, number(base.y) - base.sourceY * sy];
+  return { base, matrix: multiplyMatrices(matrix, local) };
+}
+
+function worldVertexPoints(layer) {
+  const affine = layer.shape.kind === "affine";
+  const shape = affine ? layer.shape.base : layer.shape;
+  if (["rect", "triangle", "diamond"].includes(shape.kind)) {
+    const { x, y, w, h } = shape;
+    const points = shape.kind === "rect" ? [[x,y], [x+w,y], [x+w,y+h], [x,y+h]] : vertices(shape);
+    const matrix = affine ? layer.shape.matrix : identityMatrix;
+    return points.map(([x, y]) => projectPoint(matrix, { x, y }));
+  }
+  const frame = textPointFrame(layer.shape, layer.color);
+  const model = frame && textPointModel(frame.base);
+  return model ? Array.from(model.handles.keys(), (id) => projectPoint(frame.matrix, model.points[id])) : [];
+}
+
+function snapVertexMove(edit, ends, excluded, dx, dy, direction) {
+  const limit = guideSnapDistance();
+  if (!edit.vertexGrid) {
+    const pending = layers.filter((layer) => !layer.hidden && !excluded.has(layer.id));
+    edit.vertexGrid = { cells: new Map(), size: limit, pending };
+    addVertexSnapTargets(edit.vertexGrid, edit.localSnapTargets ?? []);
+  }
+  const { cells, size } = edit.vertexGrid;
+  const area = ends.reduce((box, point) => ({
+    left: Math.min(box.left, point.x + dx - limit), right: Math.max(box.right, point.x + dx + limit),
+    top: Math.min(box.top, point.y + dy - limit), bottom: Math.max(box.bottom, point.y + dy + limit),
+  }), { left: Infinity, right: -Infinity, top: Infinity, bottom: -Infinity });
+  edit.vertexGrid.pending = edit.vertexGrid.pending.filter((layer) => {
+    const { x, y, w, h } = bounds(layer.shape);
+    if (x > area.right || x + w < area.left || y > area.bottom || y + h < area.top) return true;
+    addVertexSnapTargets(edit.vertexGrid, worldVertexPoints(layer));
+    return false;
+  });
+  let closest = null;
+  let distance = limit;
+  for (const end of ends) {
+    const x = end.x + dx;
+    const y = end.y + dy;
+    for (let col = Math.floor((x - limit) / size); col <= Math.floor((x + limit) / size); col++) {
+      for (let row = Math.floor((y - limit) / size); row <= Math.floor((y + limit) / size); row++) {
+        const targets = cells.get(col + "," + row);
+        if (!targets) continue;
+        const match = snapLineMove([end], targets, dx, dy, direction, distance);
+        if (match) {
+          closest = match;
+          distance = Math.hypot(match.dx - dx, match.dy - dy);
+        }
+      }
+    }
+  }
+  return closest;
+}
+
+function addVertexSnapTargets({ cells, size }, points) {
+  for (const point of points) {
+    const key = Math.floor(point.x / size) + "," + Math.floor(point.y / size);
+    if (!cells.has(key)) cells.set(key, []);
+    cells.get(key).push(point);
+  }
+}
+
+function textPointsInMarquee(model, positions, marquee) {
+  const selected = new Set(marquee.additive ? textPointEdit.selected : []);
+  if (!marquee.dragged) return selected;
+  const { left, top, right, bottom } = marqueeBounds(marquee);
+  for (const id of model.handles.keys()) {
+    const { x, y } = positions[id];
+    if (x >= left && x <= right && y >= top && y <= bottom) selected.add(id);
+  }
+  return selected;
+}
+
+function finishTextPointMarquee(marquee) {
+  const layer = textPointEdit && editableTextPointLayer();
+  const frame = layer && textPointFrame(layer.shape, layer.color);
+  if (frame) {
+    const { base, matrix } = frame;
+    const model = textPointModel(base);
+    textPointEdit.selected = textPointsInMarquee(model, model.points.map((point) => projectPoint(matrix, point)), marquee);
+  }
+  renderDrawing();
+}
+
+function renderTextOutlineControls(layer) {
+  const frame = layer && textPointFrame(layer.shape, layer.color);
+  if (!frame) {
+    if (textOutlineControls.firstChild) textOutlineControls.replaceChildren();
+    return;
+  }
+  const { base, matrix } = frame;
+  const model = textPointModel(base);
+  if (!model) {
+    textOutlineControls.replaceChildren();
+    return;
+  }
+  const positions = model.points.map((point) => projectPoint(matrix, point));
+  const selected = gesture?.type === "text-point-marquee" && gesture.dragged
+    ? textPointsInMarquee(model, positions, gesture) : textPointEdit.selected;
+  const anchor = selected.size === 1 ? selected.values().next().value : null;
+  const scale = svgUnitsPerPixel();
+  const radius = number(3.25 * scale);
+  const activeRadius = number(4 * scale);
+  const anchors = Array.from(model.handles.keys(), (id) => {
+    const { x, y } = positions[id];
+    const active = selected.has(id);
+    return '<circle data-text-point="' + id + '"' + (active ? ' data-active-text-point=""' : '') +
+      ' cx="' + number(x) + '" cy="' + number(y) + '" r="' + (active ? activeRadius : radius) +
+      '" vector-effect="non-scaling-stroke"/>';
+  });
+  const controls = (model.handles.get(anchor) ?? []).map((id) => {
+    const { x, y } = positions[id];
+    const start = positions[anchor];
+    return '<path d="M' + number(start.x) + ' ' + number(start.y) + 'L' + number(x) + ' ' + number(y) +
+      '" vector-effect="non-scaling-stroke"/><rect data-text-control="' + id +
+      '" x="' + number(x - radius) + '" y="' + number(y - radius) + '" width="' + 2 * radius +
+      '" height="' + 2 * radius + '" vector-effect="non-scaling-stroke"/>';
+  });
+  textOutlineControls.innerHTML = controls.join("") + anchors.join("");
+}
+
+function setTextPointEdit(enabled) {
+  textPointEdit = enabled ? { selected: new Set() } : null;
+  resizeId = null;
+  renderDrawing();
+  renderControls();
+}
+
+textOutlineEditButton.addEventListener("click", () => {
+  if (gesture) return;
+  if (textPointEdit) {
+    setTextPointEdit(null);
+    return;
+  }
+  chooseTool("select");
+  setTextPointEdit(true);
+});
+
+function startTextPointDrag(handle, event, start, layer) {
+  const { base, matrix } = textPointFrame(layer.shape, layer.color);
+  const model = textPointModel(base);
+  const control = handle.hasAttribute("data-text-control");
+  const id = Number(control ? handle.dataset.textControl : handle.dataset.textPoint);
+  if (!control && !textPointEdit.selected.has(id)) textPointEdit.selected = new Set([id]);
+  const moving = control ? new Set([id])
+    : new Set([...textPointEdit.selected].flatMap((anchor) => [anchor, ...(model.handles.get(anchor) ?? [])]));
+  gesture = {
+    type: "text-point", id: event.pointerId, layerId: layer.id, shape: layer.shape, base, matrix, model,
+    moving, original: projectPoint(matrix, model.points[id]),
+    anchor: control ? projectPoint(matrix, model.points[textPointEdit.selected.values().next().value]) : null,
+    snapEnds: control ? [] : [...textPointEdit.selected].map((anchor) => projectPoint(matrix, model.points[anchor])),
+    localSnapTargets: control ? [] : Array.from(model.handles.keys())
+      .filter((anchor) => !moving.has(anchor)).map((anchor) => projectPoint(matrix, model.points[anchor])),
+    start, pointer: start, shiftKey: event.shiftKey, disableSnap: event.ctrlKey || event.metaKey,
+  };
+  drawing.setPointerCapture(event.pointerId);
+  renderDrawing();
+}
+
+function movedTextOutline(edit) {
+  const { base, matrix, model, original, anchor, start, pointer, moving, shape } = edit;
+  edit.endpointSnap = null;
+  edit.centerHint = null;
+  if (Math.hypot(pointer.x - start.x, pointer.y - start.y) <= guideEpsilon) return shape;
+  const origin = anchor ?? original;
+  const { dx, dy, direction } = movementDirection(
+    original.x - origin.x + pointer.x - start.x, original.y - origin.y + pointer.y - start.y, edit.shiftKey,
+  );
+  let snap;
+  if (edit.snapEnds.length && !edit.disableSnap) {
+    snap = snapVertexMove(edit, edit.snapEnds, new Set([edit.layerId]), dx, dy, direction);
+    edit.endpointSnap = snap?.target;
+    if (!snap) {
+      const center = { x: origin.x + dx, y: origin.y + dy };
+      const tolerance = Math.min(14, 6 * svgUnitsPerPixel());
+      edit.pointReferences ??= [...edit.localSnapTargets];
+      edit.pendingAxisLayers ??= layers.filter((layer) => !layer.hidden && layer.id !== edit.layerId);
+      edit.pendingAxisLayers = edit.pendingAxisLayers.filter((layer) => {
+        const { x, y, w, h } = bounds(layer.shape);
+        const nearX = center.x >= x - tolerance && center.x <= x + w + tolerance;
+        const nearY = center.y >= y - tolerance && center.y <= y + h + tolerance;
+        if (!nearX && !nearY) return true;
+        for (const point of worldVertexPoints(layer)) edit.pointReferences.push(point);
+        return false;
+      });
+      const aligned = alignEditedPoint(edit, center, direction);
+      snap = { dx: aligned.x - origin.x, dy: aligned.y - origin.y };
+    }
+  }
+  const from = unprojectPoint(matrix, original);
+  const to = unprojectPoint(matrix, { x: origin.x + (snap?.dx ?? dx), y: origin.y + (snap?.dy ?? dy) });
+  const points = model.points.map((point, id) => moving.has(id)
+    ? { x: number(point.x + to.x - from.x), y: number(point.y + to.y - from.y) } : point);
+  if ([...moving].every((id) => points[id].x === model.points[id].x && points[id].y === model.points[id].y)) return shape;
+  return applyVertexPositions(shape, base, model, points) ?? shape;
+}
+
+function applyVertexPositions(shape, base, model, points) {
+  const paths = Array.from({ length: base.regions?.length ?? 1 }, () => "");
+  for (const segment of model.segments) paths[segment.region] += outlineSegmentData(segment, points);
+  const updated = updateVertexShape(shape, base, paths, [...model.jointIds].map((id) => points[id]));
+  if (!updated) return null;
+  textPointModels.set(updated.kind === "affine" ? updated.base : updated, { ...model, points });
+  return updated;
+}
+
+function updateVertexShape(shape, base, paths, joinedVertices = base.joinedVertices) {
+  const pathData = paths.join("");
+  if (!pathData) return null;
+  textOutlineMeasure.setAttribute("d", pathData);
+  const { x, y, width: w, height: h } = textOutlineMeasure.getBBox();
+  textOutlineMeasure.removeAttribute("d");
+  if (!(w > 0 && h > 0)) return null;
+  const sx = base.w / base.sourceW;
+  const sy = base.h / base.sourceH;
+  const next = {
+    ...base, joinedVertices, pathData, hitPath: new Path2D(pathData), sourceX: x, sourceY: y, sourceW: w, sourceH: h,
+    x: number(base.x) + (x - base.sourceX) * sx, y: number(base.y) + (y - base.sourceY) * sy, w: w * sx, h: h * sy,
+    ...(base.regions ? {
+      regions: base.regions.map((region, index) => ({ ...region, pathData: paths[index] })).filter((region) => region.pathData),
+    } : {}),
+  };
+  return shape.kind === "affine" ? { ...shape, base: next } : next;
+}
+
+function deleteSelectedVertices() {
+  if (!textPointEdit.selected.size) return;
+  const layer = editableTextPointLayer();
+  const frame = layer && textPointFrame(layer.shape, layer.color);
+  const model = frame && textPointModel(frame.base);
+  if (!model) return;
+  const { base } = frame;
+  const paths = outlinePathsWithoutVertices(model, textPointEdit.selected, base.regions?.length ?? 1);
+  const joins = [...model.jointIds].filter((id) => !textPointEdit.selected.has(id)).map((id) => model.points[id]);
+  const shape = updateVertexShape(layer.shape, base, paths, joins);
+  textPointEdit.selected.clear();
+  if (shape) {
+    commit(layers.map((item) => item === layer ? { ...layer, shape, inkChain: undefined } : item));
+  } else {
+    removeLayers(new Set([layer.id]));
+  }
+}
+
+vertexActions.addEventListener("click", (event) => {
+  const action = event.target.closest("[data-vertex-action]")?.dataset.vertexAction;
+  const selected = textPointEdit?.selected;
+  if (!action || gesture || !selected || selected.size < 2) return;
+  const layer = editableTextPointLayer();
+  const frame = layer && textPointFrame(layer.shape, layer.color);
+  const model = frame && textPointModel(frame.base);
+  if (!model) return;
+  const { base, matrix } = frame;
+  const merge = action === "merge";
+  const anchors = [...selected].map((id) => ({ id, ...projectPoint(matrix, model.points[id]) }));
+  const center = {
+    x: anchors.reduce((sum, point) => sum + point.x, 0) / anchors.length,
+    y: anchors.reduce((sum, point) => sum + point.y, 0) / anchors.length,
+  };
+  const points = model.points.slice();
+  const shifts = new Map();
+  for (const anchor of anchors) {
+    const x = merge || action === "x" ? center.x : anchor.x;
+    const y = merge || action === "y" ? center.y : anchor.y;
+    const local = unprojectPoint(matrix, { x, y });
+    points[anchor.id] = { x: number(local.x), y: number(local.y) };
+    const before = model.points[anchor.id];
+    for (const handle of model.handles.get(anchor.id)) {
+      const shift = shifts.get(handle) ?? { x: 0, y: 0, count: 0 };
+      shift.x += local.x - before.x;
+      shift.y += local.y - before.y;
+      shift.count++;
+      shifts.set(handle, shift);
+    }
+  }
+  for (const [id, shift] of shifts) {
+    const point = model.points[id];
+    points[id] = { x: number(point.x + shift.x / shift.count), y: number(point.y + shift.y / shift.count) };
+  }
+  if (points.every((point, id) => point.x === model.points[id].x && point.y === model.points[id].y) && !merge) return;
+  let shape;
+  if (merge) {
+    const survivor = anchors[0].id;
+    const paths = mergedVertexPaths(model, points, selected, survivor, base.regions?.length ?? 1);
+    const joins = [...model.jointIds].filter((id) => !selected.has(id)).map((id) => points[id]);
+    shape = updateVertexShape(layer.shape, base, paths, [...joins, points[survivor]]);
+  } else {
+    shape = applyVertexPositions(layer.shape, base, model, points);
+  }
+  if (!shape) {
+    showNotice("輪郭を作れる頂点が残らないため変更できません");
+    return;
+  }
+  if (merge) selected.clear();
+  commit(layers.map((item) => item === layer ? { ...item, shape, inkChain: undefined } : item));
 });
 
 function currentText() {
@@ -3308,12 +4194,16 @@ function renderTextControls(selected) {
   }
 
   const layerId = adding ? null : selected.id;
+  const savedPath = saved ? shapeFrame(selected.shape).box.pathData : null;
   if (!textState || textState.layerId !== layerId || textState.saved !== saved) {
-    textState = { layerId, saved, pending: false, preview: null };
+    textState = { layerId, saved, savedPath, pending: false, preview: null };
     textValue.value = saved?.value ?? "";
-    textFont.value = saved?.fontId ?? textFonts[0].id;
+    renderTextFontOptions(saved?.fontId ?? textFonts[0].id, saved);
     byId("text-heading").setAttribute("aria-label", adding ? "文字を追加" : "文字を編集");
     textSubmit.setAttribute("aria-label", adding ? "文字を追加" : "文字を更新");
+    queueTextPreview();
+  } else if (textState.savedPath !== savedPath) {
+    textState.savedPath = savedPath;
     queueTextPreview();
   }
   updateTextSubmit();
@@ -3329,30 +4219,36 @@ function showTextMessage(message) {
   textPreview.classList.toggle("text-preview-error", Boolean(message));
 }
 
+function showTextOutlinePreview(state, value, fontId, outline) {
+  state.preview = { value, fontId, outline };
+  const scale = Math.min(194 / outline.sourceW, 42 / outline.sourceH);
+  const w = outline.sourceW * scale;
+  const h = outline.sourceH * scale;
+  textPreview.innerHTML = primitive({ ...outline, x: (210 - w) / 2, y: (58 - h) / 2, w, h });
+}
+
 function queueTextPreview() {
   clearTimeout(textPreviewTimer);
   const state = textState;
   if (!state) return;
   const value = currentText();
-  const sample = value || "Forma";
+  const sample = value || "Illustvector";
   const fontId = textFont.value;
-  fontOptions.querySelectorAll("[data-font-id]").forEach((button) => {
-    button.setAttribute("aria-pressed", button.dataset.fontId === fontId);
-  });
   state.preview = null;
   textPreview.replaceChildren();
   showTextMessage("");
   updateTextSubmit();
+  const savedShape = state.saved?.value === value && state.saved.fontId === fontId
+    ? layers.find((layer) => layer.id === state.layerId)?.shape : null;
+  if (savedShape) {
+    showTextOutlinePreview(state, value, fontId, shapeFrame(savedShape).box);
+    return;
+  }
   textPreviewTimer = setTimeout(async () => {
     const stillCurrent = () => textState === state && currentText() === value && textFont.value === fontId;
     try {
       const outline = await createTextOutline(sample, fontId);
-      if (!stillCurrent()) return;
-      state.preview = { value, fontId, outline };
-      const scale = Math.min(194 / outline.sourceW, 42 / outline.sourceH);
-      const w = outline.sourceW * scale;
-      const h = outline.sourceH * scale;
-      textPreview.innerHTML = primitive({ ...outline, x: (210 - w) / 2, y: (58 - h) / 2, w, h });
+      if (stillCurrent()) showTextOutlinePreview(state, value, fontId, outline);
     } catch (error) {
       if (stillCurrent()) showTextMessage(error.message);
     }
@@ -3379,7 +4275,8 @@ byId("text-form").addEventListener("submit", async (event) => {
       : await createTextOutline(value, fontId);
     if (textState !== state || currentText() !== value || textFont.value !== fontId) return;
 
-    const text = { value, fontId };
+    const fontName = importedTextFonts.get(fontId)?.name;
+    const text = { value, fontId, ...(fontName ? { fontName } : {}) };
     if (state.layerId !== null) {
       const layer = layers.find((item) => item.id === state.layerId);
       const current = layer.shape;
@@ -3388,6 +4285,7 @@ byId("text-form").addEventListener("submit", async (event) => {
       const h = outline.sourceH * previous.h / previous.sourceH;
       const base = { ...outline, x: previous.x, y: previous.y, w, h };
       const shape = current.kind === "affine" ? { ...current, base } : base;
+      textPointEdit?.selected.clear();
       commit(layers.map((item) => item === layer ? { ...layer, name: value, text, shape } : item));
     } else {
       const id = nextId++;
@@ -3441,8 +4339,26 @@ document.querySelectorAll("[data-operation]").forEach((button) => button.addEven
 layerList.addEventListener("click", (event) => {
   const button = event.target.closest("button");
   if (!button) return;
-  const { layer, layerGroup, expandGroup, visibility, visibilityGroup, delete: deleteLayer, deleteGroup } = button.dataset;
-  if (expandGroup) {
+  const { layer, layerGroup, expandGroup, visibility, visibilityGroup, delete: deleteLayer, deleteGroup,
+    guideLayer, visibilityGuide, deleteGuide } = button.dataset;
+  if (guideLayer || visibilityGuide || deleteGuide) {
+    const guide = guides[guideRowIndex(Number(guideLayer ?? visibilityGuide ?? deleteGuide))];
+    if (!guide) return;
+    if (deleteGuide) {
+      removeGuide(guide);
+    } else if (visibilityGuide) {
+      const changed = replaceGuideRow(guide, guideIsHidden(guide) ? guideGeometry(guide) : { kind: "hidden-guide", base: guide });
+      if (activeGuide === guide) activeGuide = changed;
+      commit(layers, selection, guides.map((item) => item === guide ? changed : item));
+    } else {
+      cancelGesture();
+      clearLinePlacement();
+      resizeId = null;
+      selection = new Set();
+      activeGuide = guide;
+      render();
+    }
+  } else if (expandGroup) {
     const id = Number(expandGroup);
     if (!expandedLayerGroups.delete(id)) expandedLayerGroups.add(id);
     render();
@@ -3581,10 +4497,10 @@ byId("new-canvas").addEventListener("click", () => {
 byId("delete").addEventListener("click", removeSelection);
 byId("undo").addEventListener("click", () => restore(undoStack, redoStack));
 byId("redo").addEventListener("click", () => restore(redoStack, undoStack));
-function artworkSvg() {
-  const content = renderVector(layers.filter((layer) => !layer.hidden), "forma");
-  return '<svg xmlns="http://www.w3.org/2000/svg" width="' + width + '" height="' + height +
-    '" viewBox="0 0 ' + width + ' ' + height + '">' + content + '</svg>';
+function artworkSvg(box = { x: 0, y: 0, w: width, h: height }) {
+  const content = renderVector(layers.filter((layer) => !layer.hidden), "illustvector");
+  return '<svg xmlns="http://www.w3.org/2000/svg" width="' + box.w + '" height="' + box.h +
+    '" viewBox="' + [box.x, box.y, box.w, box.h].join(" ") + '">' + content + '</svg>';
 }
 
 function showNotice(message) {
@@ -3600,7 +4516,7 @@ function downloadImage(blob, format) {
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
-  link.download = "forma." + format.toLowerCase();
+  link.download = "illustvector." + format.toLowerCase();
   link.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
   showNotice(format + " を書き出しました");
@@ -3610,21 +4526,60 @@ function artworkSvgBlob() {
   return new Blob([artworkSvg()], { type: "image/svg+xml;charset=utf-8" });
 }
 
-byId("export").addEventListener("click", () => downloadImage(artworkSvgBlob(), "SVG"));
-byId("export-png").addEventListener("click", async (event) => {
+byId("export").addEventListener("click", async (event) => {
   const button = event.currentTarget;
   button.disabled = true;
+  const source = artworkSvg();
+  const url = URL.createObjectURL(new Blob([source], { type: "image/svg+xml;charset=utf-8" }));
+  try {
+    const image = new Image();
+    image.src = url;
+    await image.decode();
+    const scale = 2;
+    const canvas = document.createElement("canvas");
+    canvas.width = width * scale;
+    canvas.height = height * scale;
+    const context = canvas.getContext("2d", { willReadFrequently: true });
+    context.drawImage(image, 0, 0, canvas.width, canvas.height);
+    const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+    let left = canvas.width, top = canvas.height, right = -1, bottom = -1;
+    for (let y = 0; y < canvas.height; y++) {
+      for (let x = 0; x < canvas.width; x++) {
+        if (!pixels[(y * canvas.width + x) * 4 + 3]) continue;
+        left = Math.min(left, x); top = Math.min(top, y);
+        right = Math.max(right, x); bottom = Math.max(bottom, y);
+      }
+    }
+    const box = right < 0 ? null : { x: left / scale, y: top / scale,
+      w: (right - left + 1) / scale, h: (bottom - top + 1) / scale };
+    const svg = box ? source.replace(/width="760" height="530" viewBox="0 0 760 530"/,
+      'width="' + box.w + '" height="' + box.h + '" viewBox="' +
+      [box.x, box.y, box.w, box.h].join(" ") + '"') : source;
+    downloadImage(new Blob([svg], { type: "image/svg+xml;charset=utf-8" }), "SVG");
+  } catch {
+    showNotice("SVG を書き出せませんでした");
+  } finally {
+    URL.revokeObjectURL(url);
+    button.disabled = false;
+  }
+});
+byId("export-png").addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  const scale = Number(byId("png-resolution").value);
+  button.disabled = true;
   button.setAttribute("aria-busy", "true");
-  const url = URL.createObjectURL(artworkSvgBlob());
+  const source = artworkSvg().replace('width="760" height="530"',
+    'width="' + width * scale + '" height="' + height * scale + '"');
+  const url = URL.createObjectURL(new Blob([source], { type: "image/svg+xml;charset=utf-8" }));
   try {
     const image = new Image();
     image.src = url;
     await image.decode();
 
     const canvas = document.createElement("canvas");
-    canvas.width = width;
-    canvas.height = height;
-    canvas.getContext("2d").drawImage(image, 0, 0, width, height);
+    canvas.width = width * scale;
+    canvas.height = height * scale;
+    canvas.getContext("2d").drawImage(image, 0, 0, canvas.width, canvas.height);
     const png = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
     if (!png) throw new Error();
     downloadImage(png, "PNG");
@@ -3642,6 +4597,8 @@ const shortcuts = { y: "select", v: "select", a: "text", b: "bucket", p: "guide"
 function updateShift(equal) {
   if (pendingStraight) {
     pendingStraight.shiftKey = equal;
+  } else if (gesture?.type === "text-point") {
+    gesture.shiftKey = equal;
   } else if (gesture?.type === "draw") {
     if (gesture.dragged) gesture.shape = drawnShape(gesture.start, gesture.end, equal);
   } else if (gesture?.type === "resize") {
@@ -3668,14 +4625,24 @@ function updateStrokeControl(event) {
   if (event.key !== "Control" && event.key !== "Meta") return;
   if (pendingStraight) {
     pendingStraight.controlKey = event.ctrlKey || event.metaKey;
+  } else if (gesture?.type === "text-point") {
+    gesture.disableSnap = event.ctrlKey || event.metaKey;
   } else if (isStraightTool(gesture?.type)) {
     updateStrokeStart(gesture, event.ctrlKey || event.metaKey);
   } else if (gesture?.type === "line-resize") {
     gesture.disableSnap = event.ctrlKey || event.metaKey;
     updateLineResize();
+  } else if (gesture?.type === "curve-control") {
+    gesture.disableSnap = event.ctrlKey || event.metaKey;
+    updateBezierDirection(gesture, gesture.shiftKey);
+  } else if (gesture?.type === "ink-bend" || gesture?.type === "guide-bend") {
+    gesture.disableSnap = event.ctrlKey || event.metaKey;
+    updateMidpoint(gesture);
   } else if (gesture?.type === "move" || isSnapMove(gesture)) {
     gesture.disableSnap = event.ctrlKey || event.metaKey;
     updateSnapMove();
+  } else if (!gesture && branchCursor && !curvePoints.length) {
+    branchHover = event.ctrlKey || event.metaKey ? null : closestBranch(branchCursor);
   } else {
     return;
   }
@@ -3692,6 +4659,7 @@ document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
     if (cancelLinePlacement()) return;
     if (gesture) cancelGesture();
+    else if (textPointEdit) setTextPointEdit(null);
     else if (resizeId !== null) {
       resizeId = null;
       renderDrawing();
@@ -3712,7 +4680,7 @@ document.addEventListener("keydown", (event) => {
     return;
   }
   if (event.key === "Control" || event.key === "Meta") {
-    if (pendingStraight) updateStrokeControl(event);
+    if (pendingStraight || branchCursor) updateStrokeControl(event);
     else if (!event.repeat && !isStraightTool(tool) && !isCurveTool(tool)) resizeSelectedLayer();
     return;
   }
@@ -3737,7 +4705,8 @@ document.addEventListener("keydown", (event) => {
   if (Object.hasOwn(shortcuts, key)) chooseTool(shortcuts[key]);
   if (key === "delete" || key === "backspace") {
     event.preventDefault();
-    removeSelection();
+    if (textPointEdit) deleteSelectedVertices();
+    else removeSelection();
   }
 });
 
@@ -3806,7 +4775,7 @@ function loadDraft(withHistory = false) {
 
   cleanLayers = draft.layers;
   cleanGuides = draft.guides;
-  for (const layer of draft.layers) nextId = Math.max(nextId, layer.id + 1, (layer.groupId ?? 0) + 1);
+  for (const layer of draft.layers) nextId = Math.max(nextId, layer.id + 1, (layer.groupId ?? 0) + 1, (layer.inkChain ?? 0) + 1);
   if (withHistory) {
     if (layers !== draft.layers || guides !== draft.guides) {
       cancelGesture();

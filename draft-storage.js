@@ -11,9 +11,11 @@ const draftStorage = (() => {
   const isPoint = (point) => point && isNumber(point.x) && isNumber(point.y);
   const validControls = (points) => points === undefined ||
     (Array.isArray(points) && points.length === 2 && points.every(isPoint));
+  const validGuideGeometry = (guide) => Array.isArray(guide) ? guide.length >= 2 && guide.every(isPoint)
+    : guide?.kind === "curve" && [guide.start, guide.middle, guide.end].every(isPoint) && validControls(guide.controls);
 
   function requireValid(valid) {
-    if (!valid) throw new Error("Invalid Forma draft");
+    if (!valid) throw new Error("Invalid Illustvector draft");
   }
 
   function restoreShape(shape) {
@@ -50,12 +52,13 @@ const draftStorage = (() => {
       if (shape.kind === "xor" && shape.paints !== undefined) {
         requireValid(Array.isArray(shape.paints) && typeof shape.paintOnly === "boolean");
         restored.paintOnly = shape.paintOnly;
-        restored.paints = shape.paints.map(({ membership, color, clip }) => {
+        restored.paints = shape.paints.map(({ membership, color, clip, outline }) => {
           requireValid(Array.isArray(membership) && membership.length % 2 === 1);
           requireValid(membership.every((index) => Number.isInteger(index) && index >= 0 && index < parts.length));
           requireValid(new Set(membership).size === membership.length && isColor(color));
-          requireValid(typeof clip === "string" && /^[MHVZ0-9 .+-]*$/.test(clip));
-          return { membership, color, clip };
+          requireValid(typeof clip === "string" && /^[MLHVCQZ0-9eE+.\s-]*$/.test(clip));
+          requireValid(outline === undefined || (typeof outline === "string" && /^M[MLQCZ0-9eE+.\s-]+$/.test(outline)));
+          return { membership, color, clip, ...(outline ? { outline } : {}) };
         });
       }
       return restored;
@@ -68,11 +71,23 @@ const draftStorage = (() => {
     const { sourceX, sourceY, sourceW, sourceH, pathData } = shape;
     requireValid([sourceX, sourceY, sourceW, sourceH].every(isNumber) && sourceW > 0 && sourceH > 0);
     requireValid(typeof pathData === "string" && /^[Mm][AaCcEeHhLlMmQqSsTtVvZz0-9+.,\s-]+$/.test(pathData));
-    return { kind, x, y, w, h, sourceX, sourceY, sourceW, sourceH, pathData, hitPath: new Path2D(pathData) };
+    const { weldPoints, regions, joinedVertices } = shape;
+    requireValid(weldPoints === undefined || typeof weldPoints === "boolean");
+    requireValid(joinedVertices === undefined || (Array.isArray(joinedVertices) && joinedVertices.every(isPoint)));
+    if (regions !== undefined) {
+      requireValid(Array.isArray(regions) && regions.length > 0 && regions.every((region) =>
+        region && isColor(region.color) && typeof region.pathData === "string" &&
+        /^[MLQCZ0-9eE+.\s-]+$/.test(region.pathData)));
+      requireValid(regions.map((region) => region.pathData).join("") === pathData);
+    }
+    return { kind, x, y, w, h, sourceX, sourceY, sourceW, sourceH, pathData, hitPath: new Path2D(pathData),
+      ...(weldPoints ? { weldPoints } : {}), ...(regions ? { regions } : {}),
+      ...(joinedVertices?.length ? { joinedVertices } : {}),
+    };
   }
 
   function restoreLayer(layer) {
-    const { id, name, color, noFill, stroke, opacity, text, hidden, shape, inkBoundary, groupId } = layer;
+    const { id, name, color, noFill, stroke, opacity, text, hidden, shape, inkBoundary, groupId, inkChain } = layer;
     requireValid(Number.isSafeInteger(id) && id > 0 && id < Number.MAX_SAFE_INTEGER);
     requireValid(typeof name === "string" && isColor(color));
     requireValid(noFill === undefined || typeof noFill === "boolean");
@@ -87,14 +102,16 @@ const draftStorage = (() => {
     if (text !== undefined) {
       const base = restored.kind === "affine" ? restored.base : restored;
       requireValid(text && base.kind === "path" && typeof text.value === "string");
-      requireValid(textFonts.some((font) => font.id === text.fontId));
+      requireValid(isImportedTextFontId(text.fontId) || textFonts.some((font) => font.id === text.fontId));
+      requireValid(text.fontName === undefined || typeof text.fontName === "string");
     }
     if (inkBoundary !== undefined) {
       requireValid(Array.isArray(inkBoundary) && inkBoundary.length > 0 && new Set(inkBoundary).size === inkBoundary.length);
       requireValid(inkBoundary.every((member) => Number.isSafeInteger(member) && member > 0 && member !== id));
     }
     requireValid(groupId === undefined || (Number.isSafeInteger(groupId) && groupId > 0 && groupId < Number.MAX_SAFE_INTEGER));
-    return { id, name, color, noFill, stroke, opacity, text, hidden, inkBoundary, groupId, shape: restored };
+    requireValid(inkChain === undefined || (Number.isSafeInteger(inkChain) && inkChain > 0 && inkChain < Number.MAX_SAFE_INTEGER));
+    return { id, name, color, noFill, stroke, opacity, text, hidden, inkBoundary, groupId, inkChain, shape: restored };
   }
 
   function read(previous = null) {
@@ -106,10 +123,8 @@ const draftStorage = (() => {
     requireValid(Array.isArray(layers));
     const restored = layers.map(restoreLayer);
     requireValid(new Set(restored.map((layer) => layer.id)).size === restored.length);
-    requireValid(Array.isArray(guides) && guides.every((guide) => Array.isArray(guide)
-      ? guide.length >= 2 && guide.every(isPoint)
-      : guide?.kind === "curve" && [guide.start, guide.middle, guide.end].every(isPoint) && validControls(guide.controls),
-    ));
+    requireValid(Array.isArray(guides) && guides.every((guide) =>
+      validGuideGeometry(guide?.kind === "hidden-guide" ? guide.base : guide)));
     return { savedAt, layers: restored, guides, serialized };
   }
 
